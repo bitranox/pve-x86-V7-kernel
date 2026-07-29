@@ -5120,6 +5120,15 @@ Kernel parameters
 				Also, it enforces the PCI Local Bus spec
 				rule that those bits should be 0 in system reset
 				events (useful for kexec/kdump cases).
+		pci_acs_override =
+				[PCIE] Override missing PCIe ACS support for:
+				downstream
+					All downstream ports - full ACS capabilities
+				multifunction
+					Add multifunction devices - multifunction ACS subset
+				id:nnnn:nnnn
+					Specific device - full ACS capabilities
+					Specified as vid:did (vendor/device ID) in hex
 		noioapicquirk	[APIC] Disable all boot interrupt quirks.
 				Safety option to keep boot IRQs enabled. This
 				should never be necessary.
