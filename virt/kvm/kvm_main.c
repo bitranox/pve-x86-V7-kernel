@@ -81,7 +81,7 @@ module_param(halt_poll_ns, uint, 0644);
 EXPORT_SYMBOL_FOR_KVM_INTERNAL(halt_poll_ns);
 
 /* Default doubles per-vcpu halt_poll_ns. */
-unsigned int halt_poll_ns_grow = 2;
+unsigned int halt_poll_ns_grow = 0;
 module_param(halt_poll_ns_grow, uint, 0644);
 EXPORT_SYMBOL_FOR_KVM_INTERNAL(halt_poll_ns_grow);
 
@@ -3527,7 +3527,8 @@ void mark_page_dirty_in_slot(struct kvm *kvm,
 	if (WARN_ON_ONCE(vcpu && vcpu->kvm != kvm))
 		return;
 
-	WARN_ON_ONCE(!vcpu && !kvm_arch_allow_write_without_running_vcpu(kvm));
+	WARN_ON_ONCE(!vcpu && refcount_read(&kvm->users_count) &&
+		     !kvm_arch_allow_write_without_running_vcpu(kvm));
 #endif
 
 	if (memslot && kvm_slot_dirty_track_enabled(memslot)) {
