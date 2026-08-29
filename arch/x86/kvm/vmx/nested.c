@@ -336,6 +336,7 @@ static void nested_put_vmcs12_pages(struct kvm_vcpu *vcpu)
 static void free_nested(struct kvm_vcpu *vcpu)
 {
 	struct vcpu_vmx *vmx = to_vmx(vcpu);
+	struct vmcs *shadow_vmcs;
 
 	if (WARN_ON_ONCE(vmx->loaded_vmcs != &vmx->vmcs01))
 		vmx_switch_vmcs(vcpu, &vmx->vmcs01);
@@ -353,9 +354,15 @@ static void free_nested(struct kvm_vcpu *vcpu)
 	vmx->nested.current_vmptr = INVALID_GPA;
 	if (enable_shadow_vmcs) {
 		vmx_disable_shadow_vmcs(vmx);
-		vmcs_clear(vmx->vmcs01.shadow_vmcs);
-		free_vmcs(vmx->vmcs01.shadow_vmcs);
+
+		/*
+		 * Keep the pointer visible until after VMCLEAR, so migration
+		 * can clear an active shadow VMCS on the old CPU.
+		 */
+		shadow_vmcs = vmx->vmcs01.shadow_vmcs;
+		vmcs_clear(shadow_vmcs);
 		vmx->vmcs01.shadow_vmcs = NULL;
+		free_vmcs(shadow_vmcs);
 	}
 	kfree(vmx->nested.cached_vmcs12);
 	vmx->nested.cached_vmcs12 = NULL;
@@ -443,10 +450,14 @@ static void nested_ept_inject_page_fault(struct kvm_vcpu *vcpu,
 			vm_exit_reason = EXIT_REASON_EPT_MISCONFIG;
 			exit_qualification = 0;
 		} else {
+			u64 mask = EPT_VIOLATION_GVA_IS_VALID |
+				EPT_VIOLATION_GVA_TRANSLATED;
+			if (vmx->nested.msrs.ept_caps & VMX_EPT_ADVANCED_VMEXIT_INFO_BIT)
+				mask |= EPT_VIOLATION_GVA_USER |
+					       EPT_VIOLATION_GVA_WRITABLE |
+					       EPT_VIOLATION_GVA_NX;
 			exit_qualification = fault->exit_qualification;
-			exit_qualification |= vmx_get_exit_qual(vcpu) &
-					      (EPT_VIOLATION_GVA_IS_VALID |
-					       EPT_VIOLATION_GVA_TRANSLATED);
+			exit_qualification |= vmx_get_exit_qual(vcpu) & mask;
 			vm_exit_reason = EXIT_REASON_EPT_VIOLATION;
 		}
 
@@ -465,6 +476,13 @@ static void nested_ept_inject_page_fault(struct kvm_vcpu *vcpu,
 	vmcs12->guest_physical_address = fault->address;
 }
 
+static inline bool nested_ept_mbec_enabled(struct kvm_vcpu *vcpu)
+{
+	struct vmcs12 *vmcs12 = get_vmcs12(vcpu);
+
+	return nested_cpu_has2(vmcs12, SECONDARY_EXEC_MODE_BASED_EPT_EXEC);
+}
+
 static void nested_ept_new_eptp(struct kvm_vcpu *vcpu)
 {
 	struct vcpu_vmx *vmx = to_vmx(vcpu);
@@ -473,6 +491,7 @@ static void nested_ept_new_eptp(struct kvm_vcpu *vcpu)
 
 	kvm_init_shadow_ept_mmu(vcpu, execonly, ept_lpage_level,
 				nested_ept_ad_enabled(vcpu),
+				nested_ept_mbec_enabled(vcpu),
 				nested_ept_get_eptp(vcpu));
 }
 
@@ -553,6 +572,9 @@ static int nested_vmx_check_msr_bitmap_controls(struct kvm_vcpu *vcpu,
 static int nested_vmx_check_tpr_shadow_controls(struct kvm_vcpu *vcpu,
 						struct vmcs12 *vmcs12)
 {
+	gpa_t vtpr_gpa = vmcs12->virtual_apic_page_addr + APIC_TASKPRI;
+	u32 vtpr;
+
 	if (!nested_cpu_has(vmcs12, CPU_BASED_TPR_SHADOW))
 		return 0;
 
@@ -560,6 +582,32 @@ static int nested_vmx_check_tpr_shadow_controls(struct kvm_vcpu *vcpu,
 		return -EINVAL;
 
 	if (CC(!nested_cpu_has_vid(vmcs12) && vmcs12->tpr_threshold >> 4))
+		return -EINVAL;
+
+	/*
+	 * Do the illegal vTPR vs. TPR Threshold consistency check if and only
+	 * if KVM is configured to WARN on missed consistency checks, otherwise
+	 * it's a waste of time.  KVM needs to rely on hardware to fully detect
+	 * an illegal combination due to the vTPR being writable by L1 at all
+	 * times (it's an in-memory value, not a VMCS field).  I.e. even if the
+	 * check passes now, it might fail at the actual VM-Enter.
+	 *
+	 * If reading guest memory fails, skip the check as KVM's de facto ABI
+	 * for VMX instruction accesses to non-existent memory is to provide
+	 * PCI Bus Error semantics (reads return 0xFFs), in which case the vTPR
+	 * is guaranteed to greater than or equal to the threshold.
+	 *
+	 * Note!  Deliberately use the VM-scoped API when reading guest memory,
+	 * to ensure the read doesn't hit SMRAM when restoring L2 state on RSM,
+	 * and only perform the check when in KVM_RUN, to avoid a false failure
+	 * if userspace hasn't yet configured memslots during state restore.
+	 */
+	if (warn_on_missed_cc && vcpu->wants_to_run &&
+	    nested_cpu_has(vmcs12, CPU_BASED_TPR_SHADOW) &&
+	    !nested_cpu_has_vid(vmcs12) &&
+	    !nested_cpu_has2(vmcs12, SECONDARY_EXEC_VIRTUALIZE_APIC_ACCESSES) &&
+	    !kvm_read_guest(vcpu->kvm, vtpr_gpa, &vtpr, sizeof(vtpr)) &&
+	    CC((vmcs12->tpr_threshold & GENMASK(3, 0)) > ((vtpr >> 4) & GENMASK(3, 0))))
 		return -EINVAL;
 
 	return 0;
@@ -2440,6 +2488,7 @@ static void prepare_vmcs02_early(struct vcpu_vmx *vmx, struct loaded_vmcs *vmcs0
 				  SECONDARY_EXEC_VIRTUAL_INTR_DELIVERY |
 				  SECONDARY_EXEC_APIC_REGISTER_VIRT |
 				  SECONDARY_EXEC_ENABLE_VMFUNC |
+				  SECONDARY_EXEC_MODE_BASED_EPT_EXEC |
 				  SECONDARY_EXEC_DESC);
 
 		if (nested_cpu_has(vmcs12,
@@ -3085,38 +3134,6 @@ static int nested_vmx_check_controls(struct kvm_vcpu *vcpu,
 	return 0;
 }
 
-static int nested_vmx_check_controls_late(struct kvm_vcpu *vcpu,
-					  struct vmcs12 *vmcs12)
-{
-	void *vapic = to_vmx(vcpu)->nested.virtual_apic_map.hva;
-	u32 vtpr = vapic ? (*(u32 *)(vapic + APIC_TASKPRI)) >> 4 : 0;
-
-	/*
-	 * Don't bother with the consistency checks if KVM isn't configured to
-	 * WARN on missed consistency checks, as KVM needs to rely on hardware
-	 * to fully detect an illegal vTPR vs. TRP Threshold combination due to
-	 * the vTPR being writable by L1 at all times (it's an in-memory value,
-	 * not a VMCS field).  I.e. even if the check passes now, it might fail
-	 * at the actual VM-Enter.
-	 *
-	 * Keying off the module param also allows treating an invalid vAPIC
-	 * mapping as a consistency check failure without increasing the risk
-	 * of breaking a "real" VM.
-	 */
-	if (!warn_on_missed_cc)
-		return 0;
-
-	if ((exec_controls_get(to_vmx(vcpu)) & CPU_BASED_TPR_SHADOW) &&
-	    nested_cpu_has(vmcs12, CPU_BASED_TPR_SHADOW) &&
-	    !nested_cpu_has_vid(vmcs12) &&
-	    !nested_cpu_has2(vmcs12, SECONDARY_EXEC_VIRTUALIZE_APIC_ACCESSES) &&
-	    (CC(!vapic) ||
-	     CC((vmcs12->tpr_threshold & GENMASK(3, 0)) > (vtpr & GENMASK(3, 0)))))
-		return -EINVAL;
-
-	return 0;
-}
-
 static int nested_vmx_check_address_space_size(struct kvm_vcpu *vcpu,
 				       struct vmcs12 *vmcs12)
 {
@@ -3666,11 +3683,6 @@ enum nvmx_vmentry_status nested_vmx_enter_non_root_mode(struct kvm_vcpu *vcpu,
 			return NVMX_VMENTRY_KVM_INTERNAL_ERROR;
 		}
 
-		if (nested_vmx_check_controls_late(vcpu, vmcs12)) {
-			vmx_switch_vmcs(vcpu, &vmx->vmcs01);
-			return NVMX_VMENTRY_VMFAIL;
-		}
-
 		if (nested_vmx_check_guest_state(vcpu, vmcs12,
 						 &entry_failure_code)) {
 			exit_reason.basic = EXIT_REASON_INVALID_STATE;
@@ -3754,6 +3766,8 @@ vmentry_fail_vmexit:
 
 	if (!from_vmentry)
 		return NVMX_VMENTRY_VMEXIT;
+
+	nested_put_vmcs12_pages(vcpu);
 
 	load_vmcs12_host_state(vcpu, vmcs12);
 	vmcs12->vm_exit_reason = exit_reason.full;
@@ -7237,7 +7251,8 @@ static void nested_vmx_setup_secondary_ctls(u32 ept_caps,
 			VMX_EPT_PAGE_WALK_5_BIT |
 			VMX_EPTP_WB_BIT |
 			VMX_EPT_INVEPT_BIT |
-			VMX_EPT_EXECUTE_ONLY_BIT;
+			VMX_EPT_EXECUTE_ONLY_BIT |
+			VMX_EPT_ADVANCED_VMEXIT_INFO_BIT;
 
 		msrs->ept_caps &= ept_caps;
 		msrs->ept_caps |= VMX_EPT_EXTENT_GLOBAL_BIT |
@@ -7249,6 +7264,9 @@ static void nested_vmx_setup_secondary_ctls(u32 ept_caps,
 			msrs->ept_caps |= VMX_EPT_AD_BIT;
 		}
 
+		if (enable_mbec)
+			msrs->secondary_ctls_high |=
+				SECONDARY_EXEC_MODE_BASED_EPT_EXEC;
 		/*
 		 * Advertise EPTP switching irrespective of hardware support,
 		 * KVM emulates it in software so long as VMFUNC is supported.
@@ -7436,8 +7454,29 @@ __init int nested_vmx_hardware_setup(int (*exit_handlers[])(struct kvm_vcpu *))
 	return 0;
 }
 
+static gpa_t vmx_translate_nested_gpa(struct kvm_vcpu *vcpu, gpa_t gpa,
+				      u64 access,
+				      struct x86_exception *exception,
+				      u64 pte_access)
+{
+	struct kvm_mmu *mmu = vcpu->arch.mmu;
+
+	BUG_ON(!mmu_is_nested(vcpu));
+
+	/*
+	 * MBEC differentiates based on the effective U/S bit of
+	 * the guest page tables; not the processor CPL.
+	 */
+	access &= ~PFERR_USER_MASK;
+	if ((pte_access & ACC_USER_MASK) && (access & PFERR_GUEST_FINAL_MASK))
+		access |= PFERR_USER_MASK;
+
+	return mmu->gva_to_gpa(vcpu, mmu, gpa, access, exception);
+}
+
 struct kvm_x86_nested_ops vmx_nested_ops = {
 	.leave_nested = vmx_leave_nested,
+	.translate_nested_gpa = vmx_translate_nested_gpa,
 	.is_exception_vmexit = nested_vmx_is_exception_vmexit,
 	.check_events = vmx_check_nested_events,
 	.has_events = vmx_has_nested_events,
