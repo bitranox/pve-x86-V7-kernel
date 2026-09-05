@@ -277,6 +277,11 @@ static u64 cpuid_get_supported_xss(struct kvm_vcpu *vcpu)
 	return (best->ecx | ((u64)best->edx << 32)) & kvm_caps.supported_xss;
 }
 
+bool vcpu_supports_xsave_pkru(struct kvm_vcpu *vcpu) {
+	u64 guest_supported_xcr0 = cpuid_get_supported_xcr0(vcpu);
+	return (guest_supported_xcr0 & XFEATURE_MASK_PKRU) != 0;
+}
+
 static __always_inline void kvm_update_feature_runtime(struct kvm_vcpu *vcpu,
 						       struct kvm_cpuid_entry2 *entry,
 						       unsigned int x86_feature,
