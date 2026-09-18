@@ -130,6 +130,8 @@ retry:
 		ret = cachefiles_inject_write_error();
 		if (ret == 0) {
 			subdir = vfs_mkdir(&nop_mnt_idmap, d_inode(dir), subdir, 0700, NULL);
+			if (IS_ERR(subdir))
+				ret = PTR_ERR(subdir);
 		} else {
 			end_creating(subdir);
 			subdir = ERR_PTR(ret);
@@ -207,7 +209,6 @@ lookup_error:
 	return ERR_PTR(ret);
 
 nomem_d_alloc:
-	inode_unlock(d_inode(dir));
 	_leave(" = -ENOMEM");
 	return ERR_PTR(-ENOMEM);
 }
@@ -401,7 +402,7 @@ try_again:
 					    "Rename failed with error %d", ret);
 	}
 
-	__cachefiles_unmark_inode_in_use(object, d_inode(rep));
+	cachefiles_do_unmark_inode_in_use(object, d_inode(rep));
 	unlock_rename(cache->graveyard, dir);
 	dput(grave);
 	_leave(" = 0");

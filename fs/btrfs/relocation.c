@@ -497,6 +497,7 @@ static int __add_reloc_root(struct btrfs_root *root)
 		btrfs_err(fs_info,
 			    "Duplicate root found for start=%llu while inserting into relocation tree",
 			    node->bytenr);
+		kfree(node);
 		return -EEXIST;
 	}
 
@@ -1850,6 +1851,7 @@ again:
 				 * corruption, e.g. bad reloc tree key offset.
 				 */
 				ret = -EINVAL;
+				btrfs_put_root(root);
 				goto out;
 			}
 			ret = merge_reloc_root(rc, root);
@@ -3884,7 +3886,7 @@ static int add_remap_tree_entries(struct btrfs_trans_handle *trans, struct btrfs
 		ret = btrfs_insert_empty_items(trans, fs_info->remap_root, path, &batch);
 		btrfs_release_path(path);
 
-		if (num_entries <= max_items)
+		if (ret || num_entries <= max_items)
 			break;
 
 		num_entries -= max_items;
@@ -4180,6 +4182,12 @@ static int move_existing_remap(struct btrfs_fs_info *fs_info,
 		btrfs_space_info_update_bytes_may_use(sinfo, -length);
 		spin_unlock(&sinfo->lock);
 		return ret;
+	}
+
+	if (ins.offset < length) {
+		spin_lock(&sinfo->lock);
+		btrfs_space_info_update_bytes_may_use(sinfo, ins.offset - length);
+		spin_unlock(&sinfo->lock);
 	}
 
 	dest_addr = ins.objectid;
@@ -5006,6 +5014,12 @@ static int do_remap_reloc_trans(struct btrfs_fs_info *fs_info,
 		mutex_unlock(&fs_info->remap_mutex);
 		btrfs_end_transaction(trans);
 		return ret;
+	}
+
+	if (ins.offset < remap_length) {
+		spin_lock(&sinfo->lock);
+		btrfs_space_info_update_bytes_may_use(sinfo, ins.offset - remap_length);
+		spin_unlock(&sinfo->lock);
 	}
 
 	made_reservation = true;
