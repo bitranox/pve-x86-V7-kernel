@@ -37,6 +37,14 @@
 #define IVSC_DEV_NAME "intel_vsc"
 
 /*
+ * 822ace8f-2814-4174-a56b-5f029fe079ee
+ * This _DSM GUID returns a string from the sensor device, which acts as a
+ * module identifier.
+ */
+static const guid_t sensor_module_guid =
+	GUID_INIT(0x822ace8f, 0x2814, 0x4174,
+		  0xa5, 0x6b, 0x5f, 0x02, 0x9f, 0xe0, 0x79, 0xee);
+/*
  * Extend this array with ACPI Hardware IDs of devices known to be working
  * plus the number of link-frequencies expected by their drivers, along with
  * the frequency values in hertz. This is somewhat opportunistic way of adding
@@ -61,6 +69,8 @@ static const struct ipu_sensor_config ipu_supported_sensors[] = {
 	IPU_SENSOR_CONFIG("INT33BE", 1, 419200000),
 	/* Onsemi MT9M114 */
 	IPU_SENSOR_CONFIG("INT33F0", 1, 384000000),
+	/* Samsung S5K3J1 */
+	IPU_SENSOR_CONFIG("INT346D", 1, 848000000),
 	/* Omnivision OV2740 */
 	IPU_SENSOR_CONFIG("INT3474", 1, 180000000),
 	/* Omnivision OV5670 */
@@ -81,7 +91,7 @@ static const struct ipu_sensor_config ipu_supported_sensors[] = {
 	/* Omnivision OV02E10 */
 	IPU_SENSOR_CONFIG("OVTI02E1", 1, 360000000),
 	/* Omnivision ov05c10 */
-	IPU_SENSOR_CONFIG("OVTI05C1", 1, 480000000),
+	IPU_SENSOR_CONFIG("OVTI05C1", 2, 480000000, 900000000),
 	/* Omnivision OV08A10 */
 	IPU_SENSOR_CONFIG("OVTI08A1", 1, 500000000),
 	/* Omnivision OV08x40 */
@@ -102,6 +112,17 @@ static const struct ipu_sensor_config ipu_supported_sensors[] = {
 	IPU_SENSOR_CONFIG("TBE20A0" , 1, 200000000),
 };
 
+enum upside_down_match_type {
+	UPSIDE_DOWN_MATCH_HID,
+	UPSIDE_DOWN_MATCH_DSM,
+};
+
+struct upside_down_match_info {
+	enum upside_down_match_type type;
+	const guid_t guid;
+	const char * const ids[3];
+};
+
 /*
  * DMI matches for laptops which have their sensor mounted upside-down
  * without reporting a rotation of 180° in neither the SSDB nor the _PLD.
@@ -110,7 +131,24 @@ static const struct dmi_system_id upside_down_sensor_dmi_ids[] = {
 	{
 		.matches = {
 			DMI_EXACT_MATCH(DMI_SYS_VENDOR, "Dell Inc."),
+			DMI_EXACT_MATCH(DMI_PRODUCT_NAME, "XPS 13 9340"),
+		},
+		.driver_data = "OVTI02C1",
+	},
+	{
+		.matches = {
+			DMI_EXACT_MATCH(DMI_SYS_VENDOR, "Dell Inc."),
 			DMI_EXACT_MATCH(DMI_PRODUCT_NAME, "XPS 13 9350"),
+		},
+		.driver_data = &(struct upside_down_match_info) {
+			.type = UPSIDE_DOWN_MATCH_HID,
+			.ids = { "OVTI02C1", NULL, },
+		},
+	},
+	{
+		.matches = {
+			DMI_EXACT_MATCH(DMI_SYS_VENDOR, "Dell Inc."),
+			DMI_EXACT_MATCH(DMI_PRODUCT_NAME, "XPS 14 9440"),
 		},
 		.driver_data = "OVTI02C1",
 	},
@@ -119,7 +157,31 @@ static const struct dmi_system_id upside_down_sensor_dmi_ids[] = {
 			DMI_EXACT_MATCH(DMI_SYS_VENDOR, "Dell Inc."),
 			DMI_EXACT_MATCH(DMI_PRODUCT_NAME, "XPS 16 9640"),
 		},
-		.driver_data = "OVTI02C1",
+		.driver_data = &(struct upside_down_match_info) {
+			.type = UPSIDE_DOWN_MATCH_HID,
+			.ids = { "OVTI02C1", NULL, },
+		},
+	},
+	{
+		.matches = {
+			DMI_EXACT_MATCH(DMI_SYS_VENDOR, "Dell Inc."),
+			DMI_EXACT_MATCH(DMI_PRODUCT_NAME, "XPS 14 DA14260"),
+		},
+		.driver_data = &(struct upside_down_match_info) {
+			.type = UPSIDE_DOWN_MATCH_HID,
+			.ids = { "OVTI08F4", NULL, },
+		},
+	},
+	{
+		.matches = {
+			DMI_EXACT_MATCH(DMI_SYS_VENDOR, "Dell Inc."),
+			DMI_EXACT_MATCH(DMI_PRODUCT_NAME, "Dell Pro 14 Premium PA14260"),
+		},
+		.driver_data = &(struct upside_down_match_info) {
+			.type = UPSIDE_DOWN_MATCH_DSM,
+			.guid = sensor_module_guid,
+			.ids = { "CJFOE90_B", "BBG809N3A_B", NULL, },
+		},
 	},
 	{} /* Terminating entry */
 };
@@ -277,8 +339,35 @@ static u32 ipu_bridge_parse_rotation(struct acpi_device *adev,
 	const struct dmi_system_id *dmi_id;
 
 	dmi_id = dmi_first_match(upside_down_sensor_dmi_ids);
-	if (dmi_id && acpi_dev_hid_match(adev, dmi_id->driver_data))
-		return 180;
+	if (dmi_id) {
+		const struct upside_down_match_info *match = dmi_id->driver_data;
+		union acpi_object *obj;
+		int i;
+
+		switch (match->type) {
+		case UPSIDE_DOWN_MATCH_HID:
+			for (i = 0; match->ids[i]; i++)
+				if (acpi_dev_hid_match(adev, match->ids[i]))
+					return 180;
+
+			break;
+		case UPSIDE_DOWN_MATCH_DSM:
+			obj = acpi_evaluate_dsm_typed(adev->handle,
+						      &match->guid, 0x00,
+						      0x01, NULL, ACPI_TYPE_STRING);
+			if (!obj)
+				break;
+
+			for (i = 0; match->ids[i]; i++)
+				if (!strcmp(match->ids[i], obj->string.pointer)) {
+					ACPI_FREE(obj);
+					return 180;
+				}
+
+			ACPI_FREE(obj);
+			break;
+		}
+	}
 
 	switch (ssdb->degree) {
 	case IPU_SENSOR_ROTATION_NORMAL:

@@ -832,7 +832,7 @@ static long notify_set_filter(struct aa_listener *listener,
 
 	if (copy_from_user(&size, buf, sizeof(size)))
 		return -EFAULT;
-	if (size < sizeof(unotif))
+	if (size < sizeof(*unotif))
 		return -EINVAL;
 	/* size is capped at U16_MAX by data type */
 	unotif = kzalloc(size, GFP_KERNEL);
@@ -867,7 +867,7 @@ static long notify_set_filter(struct aa_listener *listener,
 			ret = -EINVAL;
 			goto out;
 		}
-		dfa = aa_dfa_unpack(pos, size - ((void *) unotif - pos),
+		dfa = aa_dfa_unpack(pos, size - unotif->filter,
 				    DFA_FLAG_VERIFY_STATES |
 				    TO_ACCEPT1_FLAG(YYTD_DATA32));
 		if (IS_ERR(dfa)) {
@@ -913,6 +913,7 @@ static long notify_user_response(struct aa_listener *listener,
 {
 	union apparmor_notif_resp uresp = {};
 	union apparmor_notif_resp *big_resp = NULL;
+	union apparmor_notif_resp *p_uresp = NULL;
 	long error;
 	u16 size;
 	void __user *buf = (void __user *)arg;
@@ -924,27 +925,27 @@ static long notify_user_response(struct aa_listener *listener,
 	if (size > sizeof(uresp)) {
 		/* TODO: put max size on message */
 		big_resp = (union apparmor_notif_resp *) aa_get_buffer(false);
-		if (big_resp)
+		if (!big_resp)
 			return -ENOMEM;
-		if (copy_from_user(big_resp, buf, size)) {
-			kfree(big_resp);
-			return -EFAULT;
-		}
+		p_uresp = big_resp;
 	} else {
 		size = min_t(size_t, size, sizeof(uresp));
-		if (copy_from_user(&uresp, buf, size))
-			return -EFAULT;
+		p_uresp = &uresp;
 	}
 
-	if (!notif_supported_version((struct apparmor_notif_common *)&uresp)) {
-		AA_DEBUG(DEBUG_UPCALL, "Failed response listener using unsupported protocol version %d", uresp.base.base.version);
+	if (copy_from_user(p_uresp, buf, size)) {
+		error = -EFAULT;
+		goto out;
+	}
+
+	if (!notif_supported_version((struct apparmor_notif_common *)p_uresp)) {
+		AA_DEBUG(DEBUG_UPCALL, "Failed response listener using unsupported protocol version %d", p_uresp->base.base.version);
 		error = -EPROTONOSUPPORT;
 		goto out;
 	}
-	error = aa_listener_unotif_response(listener, &uresp, size);
+	error = aa_listener_unotif_response(listener, p_uresp, size);
 out:
 	aa_put_buffer((char *) big_resp);
-
 	return error;
 }
 
@@ -1786,6 +1787,7 @@ static const struct file_operations seq_rawdata_ ##NAME ##_fops = {	      \
 	.release	= seq_rawdata_release,				      \
 }									      \
 
+#ifdef CONFIG_SECURITY_APPARMOR_EXPORT_BINARY
 static struct aa_loaddata *get_loaddata_common_ref(struct aa_common_ref *ref)
 {
 	if (ref)
@@ -1793,6 +1795,7 @@ static struct aa_loaddata *get_loaddata_common_ref(struct aa_common_ref *ref)
 						      count));
 	return NULL;
 }
+#endif
 
 static int seq_rawdata_open(struct inode *inode, struct file *file,
 			    int (*show)(struct seq_file *, void *))
@@ -2231,6 +2234,80 @@ static const struct inode_operations rawdata_link_abi_iops = {
 static const struct inode_operations rawdata_link_data_iops = {
 	.get_link	= rawdata_get_link_data,
 };
+
+/*
+ * Requires: @profile->ns->lock held
+ */
+void __aa_remove_rawdata_symlink_dents(struct aa_profile *profile)
+{
+	aafs_remove(profile->dents[AAFS_PROF_RAW_HASH]);
+	profile->dents[AAFS_PROF_RAW_HASH] = NULL;
+	aafs_remove(profile->dents[AAFS_PROF_RAW_ABI]);
+	profile->dents[AAFS_PROF_RAW_ABI] = NULL;
+	aafs_remove(profile->dents[AAFS_PROF_RAW_DATA]);
+	profile->dents[AAFS_PROF_RAW_DATA] = NULL;
+}
+
+static inline int create_symlink_dent(struct aa_profile *profile,
+				      const char *name,
+				      enum aafs_prof_type type,
+				      const struct inode_operations *iops)
+{
+	struct dentry *dent = NULL;
+	struct dentry *dir = prof_dir(profile);
+
+	if (profile->dents[type])
+		return 0;
+
+	dent = aafs_create(name, S_IFLNK | 0444, dir,
+			   &profile->label.proxy->count, NULL, NULL, iops);
+	if (IS_ERR(dent))
+		return PTR_ERR(dent);
+
+	profile->dents[type] = dent;
+	return 0;
+}
+
+/*
+ * Requires: @profile->ns->lock held
+ */
+int __aa_create_rawdata_symlink_dents(struct aa_profile *profile)
+{
+	int error;
+
+	if (!profile ||
+	    (profile->dents[AAFS_PROF_RAW_HASH] &&
+	     profile->dents[AAFS_PROF_RAW_ABI] &&
+	     profile->dents[AAFS_PROF_RAW_DATA]))
+		return 0;
+
+	if (!profile->rawdata)
+		return 0;
+
+	if (aa_g_hash_policy) {
+		error = create_symlink_dent(profile, "raw_sha256",
+					    AAFS_PROF_RAW_HASH,
+					    &rawdata_link_sha256_iops);
+		if (error)
+			return error;
+	}
+
+	error = create_symlink_dent(profile, "raw_abi",
+				    AAFS_PROF_RAW_ABI,
+				    &rawdata_link_abi_iops);
+	if (error)
+		return error;
+
+
+	error = create_symlink_dent(profile, "raw_data",
+				    AAFS_PROF_RAW_DATA,
+				    &rawdata_link_data_iops);
+	if (error)
+		return error;
+
+	return 0;
+}
+
 #endif /* CONFIG_SECURITY_APPARMOR_EXPORT_BINARY */
 
 /*
@@ -2312,31 +2389,9 @@ int __aafs_profile_mkdir(struct aa_profile *profile, struct dentry *parent)
 		profile->dents[AAFS_PROF_HASH] = dent;
 	}
 
-#ifdef CONFIG_SECURITY_APPARMOR_EXPORT_BINARY
-	if (profile->rawdata) {
-		if (aa_g_hash_policy) {
-			dent = aafs_create("raw_sha256", S_IFLNK | 0444, dir,
-					   &profile->label.proxy->count, NULL,
-					   NULL, &rawdata_link_sha256_iops);
-			if (IS_ERR(dent))
-				goto fail;
-			profile->dents[AAFS_PROF_RAW_HASH] = dent;
-		}
-		dent = aafs_create("raw_abi", S_IFLNK | 0444, dir,
-				   &profile->label.proxy->count, NULL, NULL,
-				   &rawdata_link_abi_iops);
-		if (IS_ERR(dent))
-			goto fail;
-		profile->dents[AAFS_PROF_RAW_ABI] = dent;
-
-		dent = aafs_create("raw_data", S_IFLNK | 0444, dir,
-				   &profile->label.proxy->count, NULL, NULL,
-				   &rawdata_link_data_iops);
-		if (IS_ERR(dent))
-			goto fail;
-		profile->dents[AAFS_PROF_RAW_DATA] = dent;
-	}
-#endif /*CONFIG_SECURITY_APPARMOR_EXPORT_BINARY */
+	error = __aa_create_rawdata_symlink_dents(profile);
+	if (error)
+		goto fail2;
 
 	list_for_each_entry(child, &profile->base.profiles, base.list) {
 		error = __aafs_profile_mkdir(child, prof_child_dir(profile));
@@ -2403,7 +2458,7 @@ out:
 	mutex_unlock(&parent->lock);
 	aa_put_ns(parent);
 
-	return ERR_PTR(error);
+	return error ? ERR_PTR(error) : NULL;
 }
 
 static int ns_rmdir_op(struct inode *dir, struct dentry *dentry)

@@ -247,6 +247,7 @@ struct mlx5_vport {
 	enum mlx5_eswitch_vport_event enabled_events;
 	int index;
 	struct mlx5_devlink_port *dl_port;
+	u32 agg_max_tx_speed;
 };
 
 struct mlx5_esw_indir_table;
@@ -315,6 +316,7 @@ struct mlx5_esw_offload {
 	DECLARE_HASHTABLE(termtbl_tbl, 8);
 	struct mutex termtbl_mutex; /* protects termtbl hash */
 	struct xarray vhca_map;
+	struct mutex reps_lock; /* protects representor load/unload/register */
 	const struct mlx5_eswitch_rep_ops *rep_ops[NUM_REP_TYPES];
 	u8 inline_mode;
 	atomic64_t num_flows;
@@ -897,6 +899,8 @@ int mlx5_eswitch_offloads_single_fdb_add_one(struct mlx5_eswitch *master_esw,
 void mlx5_eswitch_offloads_single_fdb_del_one(struct mlx5_eswitch *master_esw,
 					      struct mlx5_eswitch *slave_esw);
 int mlx5_eswitch_reload_ib_reps(struct mlx5_eswitch *esw);
+bool mlx5_eswitch_is_peer(struct mlx5_eswitch *esw,
+			  struct mlx5_eswitch *peer_esw);
 
 bool mlx5_eswitch_block_encap(struct mlx5_core_dev *dev, bool from_fdb);
 void mlx5_eswitch_unblock_encap(struct mlx5_core_dev *dev);
@@ -909,13 +913,6 @@ static inline int mlx5_eswitch_num_vfs(struct mlx5_eswitch *esw)
 	if (mlx5_esw_allowed(esw))
 		return esw->esw_funcs.num_vfs;
 
-	return 0;
-}
-
-static inline int mlx5_eswitch_get_npeers(struct mlx5_eswitch *esw)
-{
-	if (mlx5_esw_allowed(esw))
-		return esw->num_peers;
 	return 0;
 }
 
@@ -942,6 +939,8 @@ int mlx5_esw_ipsec_vf_packet_offload_supported(struct mlx5_core_dev *dev,
 					       u16 vport_num);
 bool mlx5_esw_host_functions_enabled(const struct mlx5_core_dev *dev);
 void mlx5_eswitch_safe_aux_devs_remove(struct mlx5_core_dev *dev);
+void mlx5_esw_reps_block(struct mlx5_eswitch *esw);
+void mlx5_esw_reps_unblock(struct mlx5_eswitch *esw);
 #else  /* CONFIG_MLX5_ESWITCH */
 /* eswitch API stubs */
 static inline int  mlx5_eswitch_init(struct mlx5_core_dev *dev) { return 0; }
@@ -986,8 +985,6 @@ static inline void
 mlx5_eswitch_offloads_single_fdb_del_one(struct mlx5_eswitch *master_esw,
 					 struct mlx5_eswitch *slave_esw) {}
 
-static inline int mlx5_eswitch_get_npeers(struct mlx5_eswitch *esw) { return 0; }
-
 static inline int
 mlx5_eswitch_reload_ib_reps(struct mlx5_eswitch *esw)
 {
@@ -1018,6 +1015,9 @@ mlx5_esw_host_functions_enabled(const struct mlx5_core_dev *dev)
 {
 	return true;
 }
+
+static inline void mlx5_esw_reps_block(struct mlx5_eswitch *esw) {}
+static inline void mlx5_esw_reps_unblock(struct mlx5_eswitch *esw) {}
 
 static inline bool
 mlx5_esw_vport_vhca_id(struct mlx5_eswitch *esw, u16 vportn, u16 *vhca_id)
