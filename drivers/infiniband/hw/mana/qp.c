@@ -21,6 +21,9 @@ static int mana_ib_cfg_vport_steering(struct mana_ib_dev *dev,
 
 	gc = mdev_to_gc(dev);
 
+	if (rx_hash_key_len > sizeof(req->hashkey))
+		return -EINVAL;
+
 	req_buf_size = struct_size(req, indir_tab, MANA_INDIRECT_TABLE_DEF_SIZE);
 	req = kzalloc(req_buf_size, GFP_KERNEL);
 	if (!req)
@@ -92,6 +95,7 @@ static int mana_ib_create_qp_rss(struct ib_qp *ibqp, struct ib_pd *pd,
 				 struct ib_qp_init_attr *attr,
 				 struct ib_udata *udata)
 {
+	struct mana_ib_pd *mana_pd = container_of(pd, struct mana_ib_pd, ibpd);
 	struct mana_ib_qp *qp = container_of(ibqp, struct mana_ib_qp, ibqp);
 	struct mana_ib_dev *mdev =
 		container_of(pd->device, struct mana_ib_dev, ib_dev);
@@ -172,6 +176,30 @@ static int mana_ib_create_qp_rss(struct ib_qp *ibqp, struct ib_pd *pd,
 
 	qp->port = port;
 
+	/* Take a reference on the vport to ensure EQs outlive this QP.
+	 * The vport must already be configured by a raw QP on the
+	 * same port — cross-port PD sharing is not supported.
+	 * Only one RSS QP per vport is allowed because each one
+	 * overwrites the steering config and destroy disables RX
+	 * globally.
+	 */
+	mutex_lock(&mana_pd->vport_mutex);
+	if (!mana_pd->vport_use_count || mana_pd->vport_port != port) {
+		mutex_unlock(&mana_pd->vport_mutex);
+		ret = -EINVAL;
+		goto fail;
+	}
+	if (mana_pd->has_rss_qp) {
+		mutex_unlock(&mana_pd->vport_mutex);
+		ibdev_dbg(&mdev->ib_dev,
+			  "Only one RSS QP per vport is supported\n");
+		ret = -EBUSY;
+		goto fail;
+	}
+	mana_pd->vport_use_count++;
+	mana_pd->has_rss_qp = true;
+	mutex_unlock(&mana_pd->vport_mutex);
+
 	for (i = 0; i < ind_tbl_size; i++) {
 		struct mana_obj_spec wq_spec = {};
 		struct mana_obj_spec cq_spec = {};
@@ -188,16 +216,19 @@ static int mana_ib_create_qp_rss(struct ib_qp *ibqp, struct ib_pd *pd,
 		cq_spec.gdma_region = cq->queue.gdma_region;
 		cq_spec.queue_size = cq->cqe * COMP_ENTRY_SIZE;
 		cq_spec.modr_ctx_id = 0;
-		eq = &mpc->ac->eqs[cq->comp_vector];
+		/* Map comp_vector to a per-vPort EQ. The modulo handles
+		 * the case where the RDMA-advertised num_comp_vectors
+		 * exceeds this port's num_queues (e.g. after ethtool -L
+		 * reduces it), remapping to an available EQ rather than
+		 * failing the QP creation.
+		 */
+		eq = &mpc->eqs[cq->comp_vector % mpc->num_queues];
 		cq_spec.attached_eq = eq->eq->id;
 
 		ret = mana_create_wq_obj(mpc, mpc->port_handle, GDMA_RQ,
 					 &wq_spec, &cq_spec, &wq->rx_object);
-		if (ret) {
-			/* Do cleanup starting with index i-1 */
-			i--;
-			goto fail;
-		}
+		if (ret)
+			goto free_vport;
 
 		/* The GDMA regions are now owned by the WQ object */
 		wq->queue.gdma_region = GDMA_INVALID_DMA_REGION;
@@ -217,8 +248,10 @@ static int mana_ib_create_qp_rss(struct ib_qp *ibqp, struct ib_pd *pd,
 
 		/* Create CQ table entry */
 		ret = mana_ib_install_cq_cb(mdev, cq);
-		if (ret)
-			goto fail;
+		if (ret) {
+			mana_destroy_wq_obj(mpc, GDMA_RQ, wq->rx_object);
+			goto free_vport;
+		}
 	}
 	resp.num_entries = i;
 
@@ -228,21 +261,23 @@ static int mana_ib_create_qp_rss(struct ib_qp *ibqp, struct ib_pd *pd,
 					 ucmd.rx_hash_key_len,
 					 ucmd.rx_hash_key);
 	if (ret)
-		goto fail;
+		goto free_vport;
 
 	ret = ib_copy_to_udata(udata, &resp, sizeof(resp));
 	if (ret) {
 		ibdev_dbg(&mdev->ib_dev,
 			  "Failed to copy to udata create rss-qp, %d\n",
 			  ret);
-		goto fail;
+		goto err_disable_vport_rx;
 	}
 
 	kfree(mana_ind_table);
 
 	return 0;
 
-fail:
+err_disable_vport_rx:
+	mana_disable_vport_rx(mpc);
+free_vport:
 	while (i-- > 0) {
 		ibwq = ind_tbl->ind_tbl[i];
 		ibcq = ibwq->cq;
@@ -253,6 +288,13 @@ fail:
 		mana_destroy_wq_obj(mpc, GDMA_RQ, wq->rx_object);
 	}
 
+	mutex_lock(&mana_pd->vport_mutex);
+	mana_pd->has_rss_qp = false;
+	mutex_unlock(&mana_pd->vport_mutex);
+
+	mana_ib_uncfg_vport(mdev, mana_pd, port);
+
+fail:
 	kfree(mana_ind_table);
 
 	return ret;
@@ -318,7 +360,7 @@ static int mana_ib_create_qp_raw(struct ib_qp *ibqp, struct ib_pd *ibpd,
 
 	err = mana_ib_cfg_vport(mdev, port, pd, mana_ucontext->doorbell);
 	if (err)
-		return -ENODEV;
+		return err;
 
 	qp->port = port;
 
@@ -340,7 +382,14 @@ static int mana_ib_create_qp_raw(struct ib_qp *ibqp, struct ib_pd *ibpd,
 	cq_spec.queue_size = send_cq->cqe * COMP_ENTRY_SIZE;
 	cq_spec.modr_ctx_id = 0;
 	eq_vec = send_cq->comp_vector;
-	eq = &mpc->ac->eqs[eq_vec];
+	if (!mpc->eqs) {
+		err = -EINVAL;
+		goto err_destroy_queue;
+	}
+	/* Map comp_vector to a per-vPort EQ. See comment in
+	 * mana_ib_create_qp_rss() for the modulo rationale.
+	 */
+	eq = &mpc->eqs[eq_vec % mpc->num_queues];
 	cq_spec.attached_eq = eq->eq->id;
 
 	err = mana_create_wq_obj(mpc, mpc->port_handle, GDMA_SQ, &wq_spec,
@@ -813,14 +862,32 @@ static int mana_ib_destroy_qp_rss(struct mana_ib_qp *qp,
 {
 	struct mana_ib_dev *mdev =
 		container_of(qp->ibqp.device, struct mana_ib_dev, ib_dev);
+	struct ib_pd *ibpd = qp->ibqp.pd;
 	struct mana_port_context *mpc;
 	struct net_device *ndev;
+	struct mana_ib_pd *pd;
 	struct mana_ib_wq *wq;
 	struct ib_wq *ibwq;
 	int i;
 
 	ndev = mana_ib_get_netdev(qp->ibqp.device, qp->port);
 	mpc = netdev_priv(ndev);
+	pd = container_of(ibpd, struct mana_ib_pd, ibpd);
+
+	/* Disable vPort RX steering before destroying RX WQ objects.
+	 * Otherwise firmware still routes traffic to the destroyed queues,
+	 * which can cause bogus completions on reused CQ IDs when the
+	 * ethernet driver later creates new queues on mana_open().
+	 *
+	 * Unlike the ethernet teardown path, mana_fence_rqs() cannot be
+	 * used here because the fence completion CQE is delivered on the
+	 * CQ which is polled by userspace (e.g. DPDK), so there is no way
+	 * for the kernel to wait for fence completion.
+	 *
+	 * This is best effort — if it fails there is not much we can do,
+	 * and mana_cfg_vport_steering() already logs the error.
+	 */
+	mana_disable_vport_rx(mpc);
 
 	for (i = 0; i < (1 << ind_tbl->log_ind_tbl_size); i++) {
 		ibwq = ind_tbl->ind_tbl[i];
@@ -829,6 +896,12 @@ static int mana_ib_destroy_qp_rss(struct mana_ib_qp *qp,
 			  wq->rx_object);
 		mana_destroy_wq_obj(mpc, GDMA_RQ, wq->rx_object);
 	}
+
+	mutex_lock(&pd->vport_mutex);
+	pd->has_rss_qp = false;
+	mutex_unlock(&pd->vport_mutex);
+
+	mana_ib_uncfg_vport(mdev, pd, qp->port);
 
 	return 0;
 }

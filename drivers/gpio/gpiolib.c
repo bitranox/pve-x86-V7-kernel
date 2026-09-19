@@ -3675,7 +3675,7 @@ static int gpiochip_set_multiple(struct gpio_chip *gc,
 				 unsigned long *mask, unsigned long *bits)
 {
 	unsigned int i;
-	int ret;
+	int ret = 0;
 
 	lockdep_assert_held(&gc->gpiodev->srcu);
 
@@ -5339,7 +5339,8 @@ static void gpiolib_dbg_show(struct seq_file *s, struct gpio_device *gdev)
 		flags = READ_ONCE(desc->flags);
 		is_irq = test_bit(GPIOD_FLAG_USED_AS_IRQ, &flags);
 		if (is_irq || test_bit(GPIOD_FLAG_REQUESTED, &flags)) {
-			gpiod_get_direction(desc);
+			if (gc->get_direction)
+				gpiod_get_direction(desc);
 			is_out = test_bit(GPIOD_FLAG_IS_OUT, &flags);
 			value = gpio_chip_get_value(gc, desc);
 			active_low = test_bit(GPIOD_FLAG_ACTIVE_LOW, &flags);

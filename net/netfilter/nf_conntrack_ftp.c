@@ -387,6 +387,9 @@ static int help(struct sk_buff *skb,
 	int found = 0, ends_in_nl;
 	typeof(nf_nat_ftp_hook) nf_nat_ftp;
 
+	if (!ct_ftp_info)
+		return NF_DROP;
+
 	/* Until there's been traffic both ways, don't look in packets. */
 	if (ctinfo != IP_CT_ESTABLISHED &&
 	    ctinfo != IP_CT_ESTABLISHED_REPLY) {
@@ -548,6 +551,9 @@ static int nf_ct_ftp_from_nlattr(struct nlattr *attr, struct nf_conn *ct)
 {
 	struct nf_ct_ftp_master *ftp = nfct_help_data(ct);
 
+	if (!ftp)
+		return -ENOENT;
+
 	/* This conntrack has been injected from user-space, always pick up
 	 * sequence tracking. Otherwise, the first FTP command after the
 	 * failover breaks.
@@ -558,6 +564,7 @@ static int nf_ct_ftp_from_nlattr(struct nlattr *attr, struct nf_conn *ct)
 }
 
 static struct nf_conntrack_helper ftp[MAX_PORTS * 2] __read_mostly;
+static struct nf_conntrack_helper *ftp_ptr[MAX_PORTS * 2] __read_mostly;
 
 static const struct nf_conntrack_expect_policy ftp_exp_policy = {
 	.max_expected	= 1,
@@ -566,7 +573,7 @@ static const struct nf_conntrack_expect_policy ftp_exp_policy = {
 
 static void __exit nf_conntrack_ftp_fini(void)
 {
-	nf_conntrack_helpers_unregister(ftp, ports_c * 2);
+	nf_conntrack_helpers_unregister(ftp_ptr, ports_c * 2);
 }
 
 static int __init nf_conntrack_ftp_init(void)
@@ -591,7 +598,7 @@ static int __init nf_conntrack_ftp_init(void)
 				  nf_ct_ftp_from_nlattr, THIS_MODULE);
 	}
 
-	ret = nf_conntrack_helpers_register(ftp, ports_c * 2);
+	ret = nf_conntrack_helpers_register(ftp, ports_c * 2, ftp_ptr);
 	if (ret < 0) {
 		pr_err("failed to register helpers\n");
 		return ret;

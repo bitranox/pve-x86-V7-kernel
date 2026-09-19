@@ -2795,8 +2795,8 @@ int ni_rename(struct ntfs_inode *dir_ni, struct ntfs_inode *new_dir_ni,
 	err = ni_add_name(new_dir_ni, ni, new_de);
 	if (!err) {
 		err = ni_remove_name(dir_ni, ni, de, &de2, &undo);
-		WARN_ON(err &&
-			ni_remove_name(new_dir_ni, ni, new_de, &de2, &undo));
+		if (err && ni_remove_name(new_dir_ni, ni, new_de, &de2, &undo))
+			_ntfs_bad_inode(&ni->vfs_inode);
 	}
 
 	/*
@@ -2854,6 +2854,11 @@ loff_t ni_seek_data_or_hole(struct ntfs_inode *ni, loff_t offset, bool data)
 			return err;
 		}
 
+		if (!clen) {
+			/* Corrupted file. */
+			return -EINVAL;
+		}
+
 		if (lcn == RESIDENT_LCN) {
 			/* clen - resident size in bytes. clen == ni->vfs_inode.i_size */
 			if (offset >= clen) {
@@ -2904,10 +2909,6 @@ loff_t ni_seek_data_or_hole(struct ntfs_inode *ni, loff_t offset, bool data)
 			}
 		}
 
-		if (!clen) {
-			/* Corrupted file. */
-			return -EINVAL;
-		}
 	}
 }
 

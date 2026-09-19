@@ -17,6 +17,14 @@ enum {
 	 * It's also ignored unless IORING_SETUP_DEFER_TASKRUN is set.
 	 */
 	IOU_F_TWQ_LAZY_WAKE			= 1,
+
+	/*
+	 * Set when task_work is queued from a waitqueue wakeup handler, where
+	 * an arbitrary provider waitqueue lock is held. Signaling the CQ ring
+	 * eventfd inline from there can recurse back into that lock through
+	 * epoll, so the eventfd signal must be deferred.
+	 */
+	IOU_F_TWQ_IN_WAKE			= 2,
 };
 
 enum io_uring_cmd_flags {
@@ -268,24 +276,30 @@ struct io_alloc_cache {
 	unsigned int		init_clear;
 };
 
+enum {
+	IO_RING_F_DRAIN_NEXT		= BIT(0),
+	IO_RING_F_OP_RESTRICTED		= BIT(1),
+	IO_RING_F_REG_RESTRICTED	= BIT(2),
+	IO_RING_F_OFF_TIMEOUT_USED	= BIT(3),
+	IO_RING_F_DRAIN_ACTIVE		= BIT(4),
+	IO_RING_F_HAS_EVFD		= BIT(5),
+	/* all CQEs should be posted only by the submitter task */
+	IO_RING_F_TASK_COMPLETE		= BIT(6),
+	IO_RING_F_LOCKLESS_CQ		= BIT(7),
+	IO_RING_F_SYSCALL_IOPOLL	= BIT(8),
+	IO_RING_F_POLL_ACTIVATED	= BIT(9),
+	IO_RING_F_DRAIN_DISABLED	= BIT(10),
+	IO_RING_F_COMPAT		= BIT(11),
+	IO_RING_F_IOWQ_LIMITS_SET	= BIT(12),
+};
+
 struct io_ring_ctx {
 	/* const or read-mostly hot data */
 	struct {
+		/* ring setup flags */
 		unsigned int		flags;
-		unsigned int		drain_next: 1;
-		unsigned int		op_restricted: 1;
-		unsigned int		reg_restricted: 1;
-		unsigned int		off_timeout_used: 1;
-		unsigned int		drain_active: 1;
-		unsigned int		has_evfd: 1;
-		/* all CQEs should be posted only by the submitter task */
-		unsigned int		task_complete: 1;
-		unsigned int		lockless_cq: 1;
-		unsigned int		syscall_iopoll: 1;
-		unsigned int		poll_activated: 1;
-		unsigned int		drain_disabled: 1;
-		unsigned int		compat: 1;
-		unsigned int		iowq_limits_set : 1;
+		/* internal state flags IO_RING_F_* flags , mostly read-only */
+		unsigned int		int_flags;
 
 		struct task_struct	*submitter_task;
 		struct io_rings		*rings;
