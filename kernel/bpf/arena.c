@@ -59,6 +59,8 @@ struct bpf_arena {
 	struct list_head vma_list;
 	/* protects vma_list */
 	struct mutex lock;
+	u64 zap_gen;
+	struct mutex zap_mutex;
 	struct irq_work     free_irq;
 	struct work_struct  free_work;
 	struct llist_head   free_spans;
@@ -228,6 +230,7 @@ static struct bpf_map *arena_map_alloc(union bpf_attr *attr)
 		goto err;
 	}
 	mutex_init(&arena->lock);
+	mutex_init(&arena->zap_mutex);
 	raw_res_spin_lock_init(&arena->spinlock);
 	err = populate_pgtable_except_pte(arena);
 	if (err) {
@@ -318,6 +321,7 @@ struct vma_list {
 	struct vm_area_struct *vma;
 	struct list_head head;
 	refcount_t mmap_count;
+	u64 zap_gen;
 };
 
 static int remember_vma(struct bpf_arena *arena, struct vm_area_struct *vma)
@@ -330,6 +334,7 @@ static int remember_vma(struct bpf_arena *arena, struct vm_area_struct *vma)
 	refcount_set(&vml->mmap_count, 1);
 	vma->vm_private_data = vml;
 	vml->vma = vma;
+	vml->zap_gen = 0;
 	list_add(&vml->head, &arena->vma_list);
 	return 0;
 }
@@ -339,6 +344,16 @@ static void arena_vm_open(struct vm_area_struct *vma)
 	struct vma_list *vml = vma->vm_private_data;
 
 	refcount_inc(&vml->mmap_count);
+}
+
+static int arena_vm_may_split(struct vm_area_struct *vma, unsigned long addr)
+{
+	return -EINVAL;
+}
+
+static int arena_vm_mremap(struct vm_area_struct *vma)
+{
+	return -EINVAL;
 }
 
 static void arena_vm_close(struct vm_area_struct *vma)
@@ -417,6 +432,8 @@ out_unlock_sigsegv:
 
 static const struct vm_operations_struct arena_vm_ops = {
 	.open		= arena_vm_open,
+	.may_split	= arena_vm_may_split,
+	.mremap		= arena_vm_mremap,
 	.close		= arena_vm_close,
 	.fault          = arena_vm_fault,
 };
@@ -486,10 +503,11 @@ static int arena_map_mmap(struct bpf_map *map, struct vm_area_struct *vma)
 	arena->user_vm_end = vma->vm_end;
 	/*
 	 * bpf_map_mmap() checks that it's being mmaped as VM_SHARED and
-	 * clears VM_MAYEXEC. Set VM_DONTEXPAND as well to avoid
-	 * potential change of user_vm_start.
+	 * clears VM_MAYEXEC. Set VM_DONTEXPAND to avoid potential change
+	 * of user_vm_start. Set VM_DONTCOPY to prevent arena VMA from
+	 * being copied into the child process on fork.
 	 */
-	vm_flags_set(vma, VM_DONTEXPAND);
+	vm_flags_set(vma, VM_DONTEXPAND | VM_DONTCOPY);
 	vma->vm_ops = &arena_vm_ops;
 	return 0;
 }
@@ -548,6 +566,10 @@ static long arena_alloc_pages(struct bpf_arena *arena, long uaddr, long page_cnt
 	long pgoff = 0;
 	u32 uaddr32;
 	int ret, i;
+
+	if (node_id != NUMA_NO_NODE &&
+	    ((unsigned int)node_id >= nr_node_ids || !node_online(node_id)))
+		return 0;
 
 	if (page_cnt > page_cnt_max)
 		return 0;
@@ -651,13 +673,60 @@ out_free_pages:
  */
 static void zap_pages(struct bpf_arena *arena, long uaddr, long page_cnt)
 {
+	unsigned long size = (unsigned long)page_cnt << PAGE_SHIFT;
+	struct vm_area_struct *vma;
+	struct mm_struct *mm;
 	struct vma_list *vml;
+	unsigned long vm_start;
+	u64 my_gen;
 
-	guard(mutex)(&arena->lock);
-	/* iterate link list under lock */
-	list_for_each_entry(vml, &arena->vma_list, head)
-		zap_page_range_single(vml->vma, uaddr,
-				      PAGE_SIZE * page_cnt, NULL);
+	/*
+	 * Taking mmap_read_lock() under arena->lock would deadlock against
+	 * arena_vm_close(), which runs with mmap_write_lock held and then
+	 * acquires arena->lock. Drop arena->lock for mmap_read_lock().
+	 *
+	 * Use per-call my_gen, recorded in vml->zap_gen, to remember which
+	 * vmls this invocation has already processed across the lock drop.
+	 * Hold zap_mutex around the whole walk so concurrent zap_pages()
+	 * callers cannot overwrite each other's marks on shared vmls --
+	 * otherwise call B's mark would make call A skip a vml that A has
+	 * not yet zapped for A's uaddr range.
+	 */
+	mutex_lock(&arena->zap_mutex);
+	mutex_lock(&arena->lock);
+	my_gen = ++arena->zap_gen;
+	for (;;) {
+		mm = NULL;
+		list_for_each_entry(vml, &arena->vma_list, head) {
+			if (vml->zap_gen >= my_gen)
+				continue;
+			vml->zap_gen = my_gen;
+			if (!mmget_not_zero(vml->vma->vm_mm))
+				continue;
+			mm = vml->vma->vm_mm;
+			vm_start = vml->vma->vm_start;
+			break;
+		}
+		if (!mm)
+			break;
+		mutex_unlock(&arena->lock);
+
+		mmap_read_lock(mm);
+		/*
+		 * Re-resolve: while we waited the VMA could have been unmapped
+		 * and a different mapping installed at the same address.
+		 */
+		vma = find_vma(mm, vm_start);
+		if (vma && vma->vm_start == vm_start &&
+		    vma->vm_file && vma->vm_file->private_data == &arena->map)
+			zap_page_range_single(vma, uaddr, size, NULL);
+		mmap_read_unlock(mm);
+		mmput(mm);
+
+		mutex_lock(&arena->lock);
+	}
+	mutex_unlock(&arena->lock);
+	mutex_unlock(&arena->zap_mutex);
 }
 
 static void arena_free_pages(struct bpf_arena *arena, long uaddr, long page_cnt, bool sleepable)
