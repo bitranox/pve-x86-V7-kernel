@@ -1257,8 +1257,9 @@ static int deliver_sample_value(struct evlist *evlist,
 				bool per_thread)
 {
 	struct perf_sample_id *sid = evlist__id2sid(evlist, v->id);
-	struct evsel *evsel;
+	struct evsel *saved_evsel = sample->evsel;
 	u64 *storage = NULL;
+	int ret;
 
 	if (sid) {
 		storage = perf_sample_id__get_period_storage(sid, sample->tid, per_thread);
@@ -1282,8 +1283,10 @@ static int deliver_sample_value(struct evlist *evlist,
 	if (!sample->period)
 		return 0;
 
-	evsel = container_of(sid->evsel, struct evsel, core);
-	return tool->sample(tool, event, sample, evsel, machine);
+	sample->evsel = container_of(sid->evsel, struct evsel, core);
+	ret = tool->sample(tool, event, sample, sample->evsel, machine);
+	sample->evsel = saved_evsel;
+	return ret;
 }
 
 static int deliver_sample_group(struct evlist *evlist,
@@ -1342,6 +1345,7 @@ static int evlist__deliver_sample(struct evlist *evlist, const struct perf_tool 
 struct deferred_event {
 	struct list_head list;
 	union perf_event *event;
+	u64 file_offset;
 };
 
 /*
@@ -1355,13 +1359,16 @@ static int evlist__deliver_deferred_callchain(struct evlist *evlist,
 					      struct machine *machine)
 {
 	struct deferred_event *de, *tmp;
-	struct evsel *evsel;
 	int ret = 0;
 
 	if (!tool->merge_deferred_callchains) {
-		evsel = evlist__id2evsel(evlist, sample->id);
-		return tool->callchain_deferred(tool, event, sample,
-						evsel, machine);
+		struct evsel *saved_evsel = sample->evsel;
+
+		sample->evsel = evlist__id2evsel(evlist, sample->id);
+		ret = tool->callchain_deferred(tool, event, sample,
+					       sample->evsel, machine);
+		sample->evsel = saved_evsel;
+		return ret;
 	}
 
 	list_for_each_entry_safe(de, tmp, &evlist->deferred_samples, list) {
@@ -1372,6 +1379,7 @@ static int evlist__deliver_deferred_callchain(struct evlist *evlist,
 			pr_err("failed to parse original sample\n");
 			break;
 		}
+		orig_sample.file_offset = de->file_offset;
 
 		if (sample->tid != orig_sample.tid)
 			continue;
@@ -1381,9 +1389,9 @@ static int evlist__deliver_deferred_callchain(struct evlist *evlist,
 		else
 			orig_sample.deferred_callchain = false;
 
-		evsel = evlist__id2evsel(evlist, orig_sample.id);
+		orig_sample.evsel = evlist__id2evsel(evlist, orig_sample.id);
 		ret = evlist__deliver_sample(evlist, tool, de->event,
-					     &orig_sample, evsel, machine);
+					     &orig_sample, orig_sample.evsel, machine);
 
 		if (orig_sample.deferred_callchain)
 			free(orig_sample.callchain);
@@ -1408,7 +1416,6 @@ static int session__flush_deferred_samples(struct perf_session *session,
 	struct evlist *evlist = session->evlist;
 	struct machine *machine = &session->machines.host;
 	struct deferred_event *de, *tmp;
-	struct evsel *evsel;
 	int ret = 0;
 
 	list_for_each_entry_safe(de, tmp, &evlist->deferred_samples, list) {
@@ -1419,10 +1426,11 @@ static int session__flush_deferred_samples(struct perf_session *session,
 			pr_err("failed to parse original sample\n");
 			break;
 		}
+		sample.file_offset = de->file_offset;
 
-		evsel = evlist__id2evsel(evlist, sample.id);
+		sample.evsel = evlist__id2evsel(evlist, sample.id);
 		ret = evlist__deliver_sample(evlist, tool, de->event,
-					     &sample, evsel, machine);
+					     &sample, sample.evsel, machine);
 
 		list_del(&de->list);
 		free(de->event);
@@ -1446,8 +1454,12 @@ static int machines__deliver_event(struct machines *machines,
 
 	dump_event(evlist, event, file_offset, sample, file_path);
 
-	evsel = evlist__id2evsel(evlist, sample->id);
+	if (!sample->evsel)
+		sample->evsel = evlist__id2evsel(evlist, sample->id);
+	else
+		assert(sample->evsel == evlist__id2evsel(evlist, sample->id));
 
+	evsel = sample->evsel;
 	machine = machines__find_for_cpumode(machines, event, sample);
 
 	switch (event->header.type) {
@@ -1475,6 +1487,7 @@ static int machines__deliver_event(struct machines *machines,
 				return -ENOMEM;
 			}
 			memcpy(de->event, event, sz);
+			de->file_offset = sample->file_offset;
 			list_add_tail(&de->list, &evlist->deferred_samples);
 			return 0;
 		}
@@ -1568,6 +1581,7 @@ static int perf_session__deliver_event(struct perf_session *session,
 		ret = 0;
 		goto out;
 	}
+	sample.file_offset = file_offset;
 
 	ret = machines__deliver_event(&session->machines, session->evlist,
 				      event, &sample, tool, file_offset, file_path);

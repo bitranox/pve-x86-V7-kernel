@@ -302,6 +302,14 @@ struct mana_recv_buf_oob {
 
 	void *buf_va;
 	bool from_pool; /* allocated from a page pool */
+	/* head page of the page_pool fragment; valid only when
+	 * from_pool && frag_count > 1.
+	 */
+	struct page *pp_page;
+	/* Fragment offset plus rxq->headroom, passed to
+	 * page_pool_dma_sync_for_cpu().
+	 */
+	u32 dma_sync_offset;
 
 	/* SGL of the buffer going to be sent as part of the work request. */
 	u32 num_sge;
@@ -478,8 +486,6 @@ struct mana_context {
 	u8 bm_hostmode;
 
 	struct mana_ethtool_hc_stats hc_stats;
-	struct mana_eq *eqs;
-	struct dentry *mana_eqs_debugfs;
 	struct workqueue_struct *per_port_queue_reset_wq;
 	/* Workqueue for querying hardware stats */
 	struct delayed_work gf_stats_work;
@@ -498,6 +504,9 @@ struct mana_port_context {
 	struct work_struct queue_reset_work;
 
 	u8 mac_addr[ETH_ALEN];
+
+	struct mana_eq *eqs;
+	struct dentry *mana_eqs_debugfs;
 
 	enum TRI_STATE rss_state;
 
@@ -545,6 +554,12 @@ struct mana_port_context {
 	struct mutex vport_mutex;
 	int vport_use_count;
 
+	/* Set by mana_set_channels() under vport_mutex to block RDMA
+	 * from grabbing the vport during the detach/attach window.
+	 * Checked by mana_cfg_vport() when called from the RDMA path.
+	 */
+	bool channel_changing;
+
 	/* Net shaper handle*/
 	struct net_shaper_handle handle;
 
@@ -568,6 +583,7 @@ struct mana_port_context {
 netdev_tx_t mana_start_xmit(struct sk_buff *skb, struct net_device *ndev);
 int mana_config_rss(struct mana_port_context *ac, enum TRI_STATE rx,
 		    bool update_hash, bool update_tab);
+int mana_disable_vport_rx(struct mana_port_context *apc);
 
 int mana_alloc_queues(struct net_device *ndev);
 int mana_attach(struct net_device *ndev);
@@ -1021,8 +1037,10 @@ void mana_destroy_wq_obj(struct mana_port_context *apc, u32 wq_type,
 			 mana_handle_t wq_obj);
 
 int mana_cfg_vport(struct mana_port_context *apc, u32 protection_dom_id,
-		   u32 doorbell_pg_id);
+		   u32 doorbell_pg_id, bool check_channel_changing);
 void mana_uncfg_vport(struct mana_port_context *apc);
+int mana_create_eq(struct mana_port_context *apc);
+void mana_destroy_eq(struct mana_port_context *apc);
 
 struct net_device *mana_get_primary_netdev(struct mana_context *ac,
 					   u32 port_index,

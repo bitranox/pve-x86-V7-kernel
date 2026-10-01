@@ -764,17 +764,22 @@ static inline u64 cfs_rq_max_slice(struct cfs_rq *cfs_rq);
  *
  *   -r_max < lag < max(r_max, q)
  */
-static void update_entity_lag(struct cfs_rq *cfs_rq, struct sched_entity *se)
+static s64 entity_lag(struct cfs_rq *cfs_rq, struct sched_entity *se, u64 avruntime)
 {
 	u64 max_slice = cfs_rq_max_slice(cfs_rq) + TICK_NSEC;
 	s64 vlag, limit;
 
-	WARN_ON_ONCE(!se->on_rq);
-
-	vlag = avg_vruntime(cfs_rq) - se->vruntime;
+	vlag = avruntime - se->vruntime;
 	limit = calc_delta_fair(max_slice, se);
 
-	se->vlag = clamp(vlag, -limit, limit);
+	return clamp(vlag, -limit, limit);
+}
+
+static void update_entity_lag(struct cfs_rq *cfs_rq, struct sched_entity *se)
+{
+	WARN_ON_ONCE(!se->on_rq);
+
+	se->vlag = entity_lag(cfs_rq, se, avg_vruntime(cfs_rq));
 }
 
 /*
@@ -1007,7 +1012,7 @@ static inline void cancel_protect_slice(struct sched_entity *se)
  *
  * Which allows tree pruning through eligibility.
  */
-static struct sched_entity *__pick_eevdf(struct cfs_rq *cfs_rq, bool protect)
+static struct sched_entity *pick_eevdf(struct cfs_rq *cfs_rq, bool protect)
 {
 	struct rb_node *node = cfs_rq->tasks_timeline.rb_root.rb_node;
 	struct sched_entity *se = __pick_first_entity(cfs_rq);
@@ -1076,11 +1081,6 @@ found:
 		best = curr;
 
 	return best;
-}
-
-static struct sched_entity *pick_eevdf(struct cfs_rq *cfs_rq)
-{
-	return __pick_eevdf(cfs_rq, true);
 }
 
 struct sched_entity *__pick_last_entity(struct cfs_rq *cfs_rq)
@@ -3841,23 +3841,125 @@ dequeue_load_avg(struct cfs_rq *cfs_rq, struct sched_entity *se)
 		    se_weight(se) * -se->avg.load_sum);
 }
 
-static void place_entity(struct cfs_rq *cfs_rq, struct sched_entity *se, int flags);
+static void
+rescale_entity(struct sched_entity *se, unsigned long weight, bool rel_vprot)
+{
+	unsigned long old_weight = se->load.weight;
+
+	/*
+	 * VRUNTIME
+	 * --------
+	 *
+	 * COROLLARY #1: The virtual runtime of the entity needs to be
+	 * adjusted if re-weight at !0-lag point.
+	 *
+	 * Proof: For contradiction assume this is not true, so we can
+	 * re-weight without changing vruntime at !0-lag point.
+	 *
+	 *             Weight	VRuntime   Avg-VRuntime
+	 *     before    w          v            V
+	 *      after    w'         v'           V'
+	 *
+	 * Since lag needs to be preserved through re-weight:
+	 *
+	 *	lag = (V - v)*w = (V'- v')*w', where v = v'
+	 *	==>	V' = (V - v)*w/w' + v		(1)
+	 *
+	 * Let W be the total weight of the entities before reweight,
+	 * since V' is the new weighted average of entities:
+	 *
+	 *	V' = (WV + w'v - wv) / (W + w' - w)	(2)
+	 *
+	 * by using (1) & (2) we obtain:
+	 *
+	 *	(WV + w'v - wv) / (W + w' - w) = (V - v)*w/w' + v
+	 *	==> (WV-Wv+Wv+w'v-wv)/(W+w'-w) = (V - v)*w/w' + v
+	 *	==> (WV - Wv)/(W + w' - w) + v = (V - v)*w/w' + v
+	 *	==>	(V - v)*W/(W + w' - w) = (V - v)*w/w' (3)
+	 *
+	 * Since we are doing at !0-lag point which means V != v, we
+	 * can simplify (3):
+	 *
+	 *	==>	W / (W + w' - w) = w / w'
+	 *	==>	Ww' = Ww + ww' - ww
+	 *	==>	W * (w' - w) = w * (w' - w)
+	 *	==>	W = w	(re-weight indicates w' != w)
+	 *
+	 * So the cfs_rq contains only one entity, hence vruntime of
+	 * the entity @v should always equal to the cfs_rq's weighted
+	 * average vruntime @V, which means we will always re-weight
+	 * at 0-lag point, thus breach assumption. Proof completed.
+	 *
+	 *
+	 * COROLLARY #2: Re-weight does NOT affect weighted average
+	 * vruntime of all the entities.
+	 *
+	 * Proof: According to corollary #1, Eq. (1) should be:
+	 *
+	 *	(V - v)*w = (V' - v')*w'
+	 *	==>    v' = V' - (V - v)*w/w'		(4)
+	 *
+	 * According to the weighted average formula, we have:
+	 *
+	 *	V' = (WV - wv + w'v') / (W - w + w')
+	 *	   = (WV - wv + w'(V' - (V - v)w/w')) / (W - w + w')
+	 *	   = (WV - wv + w'V' - Vw + wv) / (W - w + w')
+	 *	   = (WV + w'V' - Vw) / (W - w + w')
+	 *
+	 *	==>  V'*(W - w + w') = WV + w'V' - Vw
+	 *	==>	V' * (W - w) = (W - w) * V	(5)
+	 *
+	 * If the entity is the only one in the cfs_rq, then reweight
+	 * always occurs at 0-lag point, so V won't change. Or else
+	 * there are other entities, hence W != w, then Eq. (5) turns
+	 * into V' = V. So V won't change in either case, proof done.
+	 *
+	 *
+	 * So according to corollary #1 & #2, the effect of re-weight
+	 * on vruntime should be:
+	 *
+	 *	v' = V' - (V - v) * w / w'		(4)
+	 *	   = V  - (V - v) * w / w'
+	 *	   = V  - vl * w / w'
+	 *	   = V  - vl'
+	 */
+	se->vlag = div64_long(se->vlag * old_weight, weight);
+
+	/*
+	 * DEADLINE
+	 * --------
+	 *
+	 * When the weight changes, the virtual time slope changes and
+	 * we should adjust the relative virtual deadline accordingly.
+	 *
+	 *	d' = v' + (d - v)*w/w'
+	 *	   = V' - (V - v)*w/w' + (d - v)*w/w'
+	 *	   = V  - (V - v)*w/w' + (d - v)*w/w'
+	 *	   = V  + (d - V)*w/w'
+	 */
+	if (se->rel_deadline)
+		se->deadline = div64_long(se->deadline * old_weight, weight);
+
+	if (rel_vprot)
+		se->vprot = div64_long(se->vprot * old_weight, weight);
+}
 
 static void reweight_entity(struct cfs_rq *cfs_rq, struct sched_entity *se,
 			    unsigned long weight)
 {
 	bool curr = cfs_rq->curr == se;
 	bool rel_vprot = false;
-	u64 vprot;
+	u64 avruntime = 0;
 
 	if (se->on_rq) {
 		/* commit outstanding execution time */
 		update_curr(cfs_rq);
-		update_entity_lag(cfs_rq, se);
-		se->deadline -= se->vruntime;
+		avruntime = avg_vruntime(cfs_rq);
+		se->vlag = entity_lag(cfs_rq, se, avruntime);
+		se->deadline -= avruntime;
 		se->rel_deadline = 1;
 		if (curr && protect_slice(se)) {
-			vprot = se->vprot - se->vruntime;
+			se->vprot -= avruntime;
 			rel_vprot = true;
 		}
 
@@ -3868,30 +3970,23 @@ static void reweight_entity(struct cfs_rq *cfs_rq, struct sched_entity *se,
 	}
 	dequeue_load_avg(cfs_rq, se);
 
-	/*
-	 * Because we keep se->vlag = V - v_i, while: lag_i = w_i*(V - v_i),
-	 * we need to scale se->vlag when w_i changes.
-	 */
-	se->vlag = div_s64(se->vlag * se->load.weight, weight);
-	if (se->rel_deadline)
-		se->deadline = div_s64(se->deadline * se->load.weight, weight);
-
-	if (rel_vprot)
-		vprot = div_s64(vprot * se->load.weight, weight);
+	rescale_entity(se, weight, rel_vprot);
 
 	update_load_set(&se->load, weight);
 
 	do {
 		u32 divider = get_pelt_divider(&se->avg);
-
 		se->avg.load_avg = div_u64(se_weight(se) * se->avg.load_sum, divider);
 	} while (0);
 
 	enqueue_load_avg(cfs_rq, se);
 	if (se->on_rq) {
-		place_entity(cfs_rq, se, 0);
 		if (rel_vprot)
-			se->vprot = se->vruntime + vprot;
+			se->vprot += avruntime;
+		se->deadline += avruntime;
+		se->rel_deadline = 0;
+		se->vruntime = avruntime - se->vlag;
+
 		update_load_add(&cfs_rq->load, se->load.weight);
 		if (!curr)
 			__enqueue_entity(cfs_rq, se);
@@ -4360,7 +4455,8 @@ static inline void
 update_tg_cfs_runnable(struct cfs_rq *cfs_rq, struct sched_entity *se, struct cfs_rq *gcfs_rq)
 {
 	long delta_sum, delta_avg = gcfs_rq->avg.runnable_avg - se->avg.runnable_avg;
-	u32 new_sum, divider;
+	u64 new_sum;
+	u32 divider;
 
 	/* Nothing to update */
 	if (!delta_avg)
@@ -4374,7 +4470,7 @@ update_tg_cfs_runnable(struct cfs_rq *cfs_rq, struct sched_entity *se, struct cf
 
 	/* Set new sched_entity's runnable */
 	se->avg.runnable_avg = gcfs_rq->avg.runnable_avg;
-	new_sum = se->avg.runnable_avg * divider;
+	new_sum = (u64)se->avg.runnable_avg * divider;
 	delta_sum = (long)new_sum - (long)se->avg.runnable_sum;
 	se->avg.runnable_sum = new_sum;
 
@@ -4743,13 +4839,86 @@ static void detach_entity_load_avg(struct cfs_rq *cfs_rq, struct sched_entity *s
 	trace_pelt_cfs_tp(cfs_rq);
 }
 
+#define UTIL_EST_MARGIN (SCHED_CAPACITY_SCALE / 100)
+
+static inline void util_est_update(struct sched_entity *se)
+{
+	unsigned int ewma, dequeued, last_ewma_diff;
+
+	if (!sched_feat(UTIL_EST))
+		return;
+
+	/* Get current estimate of utilization */
+	ewma = READ_ONCE(se->avg.util_est);
+
+	/*
+	 * If the PELT values haven't changed since enqueue time,
+	 * skip the util_est update.
+	 */
+	if (ewma & UTIL_AVG_UNCHANGED)
+		return;
+
+	/* Get utilization at dequeue */
+	dequeued = READ_ONCE(se->avg.util_avg);
+
+	/*
+	 * Reset EWMA on utilization increases, the moving average is used only
+	 * to smooth utilization decreases.
+	 */
+	if (ewma <= dequeued) {
+		ewma = dequeued;
+		goto done;
+	}
+
+	/*
+	 * Skip update of task's estimated utilization when its members are
+	 * already ~1% close to its last activation value.
+	 */
+	last_ewma_diff = ewma - dequeued;
+	if (last_ewma_diff < UTIL_EST_MARGIN)
+		goto done;
+
+	/*
+	 * To avoid underestimate of task utilization, skip updates of EWMA if
+	 * we cannot grant that thread got all CPU time it wanted.
+	 */
+	if ((dequeued + UTIL_EST_MARGIN) < READ_ONCE(se->avg.runnable_avg))
+		goto done;
+
+	/*
+	 * Update Task's estimated utilization
+	 *
+	 * When *p completes an activation we can consolidate another sample
+	 * of the task size. This is done by using this value to update the
+	 * Exponential Weighted Moving Average (EWMA):
+	 *
+	 *  ewma(t) = w *  task_util(p) + (1-w) * ewma(t-1)
+	 *          = w *  task_util(p) +         ewma(t-1)  - w * ewma(t-1)
+	 *          = w * (task_util(p) -         ewma(t-1)) +     ewma(t-1)
+	 *          = w * (      -last_ewma_diff           ) +     ewma(t-1)
+	 *          = w * (-last_ewma_diff +  ewma(t-1) / w)
+	 *
+	 * Where 'w' is the weight of new samples, which is configured to be
+	 * 0.25, thus making w=1/4 ( >>= UTIL_EST_WEIGHT_SHIFT)
+	 */
+	ewma <<= UTIL_EST_WEIGHT_SHIFT;
+	ewma  -= last_ewma_diff;
+	ewma >>= UTIL_EST_WEIGHT_SHIFT;
+done:
+	ewma |= UTIL_AVG_UNCHANGED;
+	WRITE_ONCE(se->avg.util_est, ewma);
+
+	trace_sched_util_est_se_tp(se);
+}
+
 /*
  * Optional action to be done while updating the load average
  */
-#define UPDATE_TG	0x1
-#define SKIP_AGE_LOAD	0x2
-#define DO_ATTACH	0x4
-#define DO_DETACH	0x8
+#define UPDATE_TG	0x01
+#define SKIP_AGE_LOAD	0x02
+#define DO_ATTACH	0x04
+#define DO_DETACH	0x08
+#define UPDATE_UTIL_EST	0x10
 
 /* Update task and its cfs_rq load average */
 static inline void update_load_avg(struct cfs_rq *cfs_rq, struct sched_entity *se, int flags)
@@ -4792,6 +4961,9 @@ static inline void update_load_avg(struct cfs_rq *cfs_rq, struct sched_entity *s
 		if (flags & UPDATE_TG)
 			update_tg_load_avg(cfs_rq);
 	}
+
+	if (flags & UPDATE_UTIL_EST)
+		util_est_update(se);
 }
 
 /*
@@ -4850,11 +5022,6 @@ static inline unsigned long task_util(struct task_struct *p)
 	return READ_ONCE(p->se.avg.util_avg);
 }
 
-static inline unsigned long task_runnable(struct task_struct *p)
-{
-	return READ_ONCE(p->se.avg.runnable_avg);
-}
-
 static inline unsigned long _task_util_est(struct task_struct *p)
 {
 	return READ_ONCE(p->se.avg.util_est) & ~UTIL_AVG_UNCHANGED;
@@ -4895,88 +5062,6 @@ static inline void util_est_dequeue(struct cfs_rq *cfs_rq,
 	WRITE_ONCE(cfs_rq->avg.util_est, enqueued);
 
 	trace_sched_util_est_cfs_tp(cfs_rq);
-}
-
-#define UTIL_EST_MARGIN (SCHED_CAPACITY_SCALE / 100)
-
-static inline void util_est_update(struct cfs_rq *cfs_rq,
-				   struct task_struct *p,
-				   bool task_sleep)
-{
-	unsigned int ewma, dequeued, last_ewma_diff;
-
-	if (!sched_feat(UTIL_EST))
-		return;
-
-	/*
-	 * Skip update of task's estimated utilization when the task has not
-	 * yet completed an activation, e.g. being migrated.
-	 */
-	if (!task_sleep)
-		return;
-
-	/* Get current estimate of utilization */
-	ewma = READ_ONCE(p->se.avg.util_est);
-
-	/*
-	 * If the PELT values haven't changed since enqueue time,
-	 * skip the util_est update.
-	 */
-	if (ewma & UTIL_AVG_UNCHANGED)
-		return;
-
-	/* Get utilization at dequeue */
-	dequeued = task_util(p);
-
-	/*
-	 * Reset EWMA on utilization increases, the moving average is used only
-	 * to smooth utilization decreases.
-	 */
-	if (ewma <= dequeued) {
-		ewma = dequeued;
-		goto done;
-	}
-
-	/*
-	 * Skip update of task's estimated utilization when its members are
-	 * already ~1% close to its last activation value.
-	 */
-	last_ewma_diff = ewma - dequeued;
-	if (last_ewma_diff < UTIL_EST_MARGIN)
-		goto done;
-
-	/*
-	 * To avoid underestimate of task utilization, skip updates of EWMA if
-	 * we cannot grant that thread got all CPU time it wanted.
-	 */
-	if ((dequeued + UTIL_EST_MARGIN) < task_runnable(p))
-		goto done;
-
-
-	/*
-	 * Update Task's estimated utilization
-	 *
-	 * When *p completes an activation we can consolidate another sample
-	 * of the task size. This is done by using this value to update the
-	 * Exponential Weighted Moving Average (EWMA):
-	 *
-	 *  ewma(t) = w *  task_util(p) + (1-w) * ewma(t-1)
-	 *          = w *  task_util(p) +         ewma(t-1)  - w * ewma(t-1)
-	 *          = w * (task_util(p) -         ewma(t-1)) +     ewma(t-1)
-	 *          = w * (      -last_ewma_diff           ) +     ewma(t-1)
-	 *          = w * (-last_ewma_diff +  ewma(t-1) / w)
-	 *
-	 * Where 'w' is the weight of new samples, which is configured to be
-	 * 0.25, thus making w=1/4 ( >>= UTIL_EST_WEIGHT_SHIFT)
-	 */
-	ewma <<= UTIL_EST_WEIGHT_SHIFT;
-	ewma  -= last_ewma_diff;
-	ewma >>= UTIL_EST_WEIGHT_SHIFT;
-done:
-	ewma |= UTIL_AVG_UNCHANGED;
-	WRITE_ONCE(p->se.avg.util_est, ewma);
-
-	trace_sched_util_est_se_tp(&p->se);
 }
 
 static inline unsigned long get_actual_cpu_capacity(int cpu)
@@ -5249,7 +5334,7 @@ place_entity(struct cfs_rq *cfs_rq, struct sched_entity *se, int flags)
 
 	se->vruntime = vruntime - lag;
 
-	if (se->rel_deadline) {
+	if (sched_feat(PLACE_REL_DEADLINE) && se->rel_deadline) {
 		se->deadline += se->vruntime;
 		se->rel_deadline = 0;
 		return;
@@ -5410,7 +5495,7 @@ static bool
 dequeue_entity(struct cfs_rq *cfs_rq, struct sched_entity *se, int flags)
 {
 	bool sleep = flags & DEQUEUE_SLEEP;
-	int action = UPDATE_TG;
+	int action = 0;
 
 	update_curr(cfs_rq);
 	clear_buddies(cfs_rq, se);
@@ -5430,14 +5515,22 @@ dequeue_entity(struct cfs_rq *cfs_rq, struct sched_entity *se, int flags)
 
 		if (sched_feat(DELAY_DEQUEUE) && delay &&
 		    !entity_eligible(cfs_rq, se)) {
-			update_load_avg(cfs_rq, se, 0);
+			if (entity_is_task(se))
+				action |= UPDATE_UTIL_EST;
+			update_load_avg(cfs_rq, se, action);
 			set_delayed(se);
 			return false;
 		}
 	}
 
-	if (entity_is_task(se) && task_on_rq_migrating(task_of(se)))
-		action |= DO_DETACH;
+	action = UPDATE_TG;
+	if (entity_is_task(se)) {
+		if (task_on_rq_migrating(task_of(se)))
+			action |= DO_DETACH;
+
+		if (sleep && !(flags & DEQUEUE_DELAYED))
+			action |= UPDATE_UTIL_EST;
+	}
 
 	/*
 	 * When dequeuing a sched_entity, we must:
@@ -5540,11 +5633,11 @@ static int dequeue_entities(struct rq *rq, struct sched_entity *se, int flags);
  * 4) do not run the "skip" process, if something else is available
  */
 static struct sched_entity *
-pick_next_entity(struct rq *rq, struct cfs_rq *cfs_rq)
+pick_next_entity(struct rq *rq, struct cfs_rq *cfs_rq, bool protect)
 {
 	struct sched_entity *se;
 
-	se = pick_eevdf(cfs_rq);
+	se = pick_eevdf(cfs_rq, protect);
 	if (se->sched_delayed) {
 		dequeue_entities(rq, se, DEQUEUE_SLEEP | DEQUEUE_DELAYED);
 		/*
@@ -7185,7 +7278,6 @@ static bool dequeue_task_fair(struct rq *rq, struct task_struct *p, int flags)
 	if (!p->se.sched_delayed)
 		util_est_dequeue(&rq->cfs, p);
 
-	util_est_update(&rq->cfs, p, flags & DEQUEUE_SLEEP);
 	if (dequeue_entities(rq, &p->se, flags) < 0)
 		return false;
 
@@ -8004,14 +8096,11 @@ static int select_idle_sibling(struct task_struct *p, int prev, int target)
 static unsigned long
 cpu_util(int cpu, struct task_struct *p, int dst_cpu, int boost)
 {
+	bool add_task = p && task_cpu(p) != cpu && dst_cpu == cpu;
+	bool sub_task = p && task_cpu(p) == cpu && dst_cpu != cpu;
 	struct cfs_rq *cfs_rq = &cpu_rq(cpu)->cfs;
 	unsigned long util = READ_ONCE(cfs_rq->avg.util_avg);
 	unsigned long runnable;
-
-	if (boost) {
-		runnable = READ_ONCE(cfs_rq->avg.runnable_avg);
-		util = max(util, runnable);
-	}
 
 	/*
 	 * If @dst_cpu is -1 or @p migrates from @cpu to @dst_cpu remove its
@@ -8019,10 +8108,20 @@ cpu_util(int cpu, struct task_struct *p, int dst_cpu, int boost)
 	 * contribution. In all the other cases @cpu is not impacted by the
 	 * migration so its util_avg is already correct.
 	 */
-	if (p && task_cpu(p) == cpu && dst_cpu != cpu)
-		lsub_positive(&util, task_util(p));
-	else if (p && task_cpu(p) != cpu && dst_cpu == cpu)
+	if (add_task)
 		util += task_util(p);
+	else if (sub_task)
+		lsub_positive(&util, task_util(p));
+
+	if (boost) {
+		runnable = READ_ONCE(cfs_rq->avg.runnable_avg);
+		if (add_task)
+			runnable += READ_ONCE(p->se.avg.runnable_avg);
+		else if (sub_task)
+			lsub_positive(&runnable,
+				      READ_ONCE(p->se.avg.runnable_avg));
+		util = max(util, runnable);
+	}
 
 	if (sched_feat(UTIL_EST)) {
 		unsigned long util_est;
@@ -8809,7 +8908,7 @@ static void wakeup_preempt_fair(struct rq *rq, struct task_struct *p, int wake_f
 {
 	enum preempt_wakeup_action preempt_action = PREEMPT_WAKEUP_PICK;
 	struct task_struct *donor = rq->donor;
-	struct sched_entity *se = &donor->se, *pse = &p->se;
+	struct sched_entity *nse, *se = &donor->se, *pse = &p->se;
 	struct cfs_rq *cfs_rq = task_cfs_rq(donor);
 	int cse_is_idle, pse_is_idle;
 
@@ -8920,11 +9019,18 @@ static void wakeup_preempt_fair(struct rq *rq, struct task_struct *p, int wake_f
 	}
 
 pick:
-	/*
-	 * If @p has become the most eligible task, force preemption.
-	 */
-	if (__pick_eevdf(cfs_rq, preempt_action != PREEMPT_WAKEUP_SHORT) == pse)
+	nse = pick_next_entity(rq, cfs_rq, preempt_action != PREEMPT_WAKEUP_SHORT);
+	/* If @p has become the most eligible task, force preemption */
+	if (nse == pse)
 		goto preempt;
+
+	/*
+	 * Because p is enqueued, nse being null can only mean that we
+	 * dequeued a delayed task. If there are still entities queued in
+	 * cfs, check if the next one will be p.
+	 */
+	if (!nse && cfs_rq->nr_queued)
+		goto pick;
 
 	if (sched_feat(RUN_TO_PARITY))
 		update_protect_slice(cfs_rq, se);
@@ -8959,7 +9065,7 @@ again:
 
 		throttled |= check_cfs_rq_runtime(cfs_rq);
 
-		se = pick_next_entity(rq, cfs_rq);
+		se = pick_next_entity(rq, cfs_rq, true);
 		if (!se)
 			goto again;
 		cfs_rq = group_cfs_rq(se);
