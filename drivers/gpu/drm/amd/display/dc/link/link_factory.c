@@ -549,7 +549,9 @@ static bool construct_phy(struct dc_link *link,
 		goto ddc_create_fail;
 	}
 
-	if (!link->ddc->ddc_pin) {
+	/* Embedded display connectors such as LVDS may not have DDC. */
+	if (!link->ddc->ddc_pin &&
+	    !dc_is_embedded_signal(link->connector_signal)) {
 		DC_ERROR("Failed to get I2C info for connector!\n");
 		goto ddc_create_fail;
 	}
@@ -577,7 +579,7 @@ static bool construct_phy(struct dc_link *link,
 
 		DC_LOG_DC("BIOS object table - hpd_gpio id: %d", enc_init_data.hpd_gpio->id);
 		DC_LOG_DC("BIOS object table - hpd_gpio en: %d", enc_init_data.hpd_gpio->en);
-	} else {
+	} else if (link->ctx->dce_version > DCN_VERSION_4_01) {
 		struct graphics_object_hpd_info hpd_info;
 
 		if (link->ctx->dc_bios->funcs->get_hpd_info(link->ctx->dc_bios, link->link_id, &hpd_info) == BP_RESULT_OK) {

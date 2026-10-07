@@ -56,8 +56,11 @@ static u32 edid_extract_panel_id(struct edid *edid)
 	       (u32)EDID_PRODUCT_ID(edid);
 }
 
-static void apply_edid_quirks(struct drm_device *dev, struct edid *edid, struct dc_edid_caps *edid_caps)
+static void apply_edid_quirks(struct dc_link *link, struct edid *edid,
+			      struct dc_edid_caps *edid_caps)
 {
+	struct amdgpu_dm_connector *aconnector = link->priv;
+	struct drm_device *dev = aconnector->base.dev;
 	uint32_t panel_id = edid_extract_panel_id(edid);
 
 	switch (panel_id) {
@@ -87,6 +90,22 @@ static void apply_edid_quirks(struct drm_device *dev, struct edid *edid, struct 
 		drm_dbg_driver(dev, "Disabling VSC on monitor with panel id %X\n", panel_id);
 		edid_caps->panel_patch.disable_colorimetry = true;
 		break;
+	/* Workaround for monitors that get corrupted by the PHY SSC reduction */
+	case drm_edid_encode_panel_id('D', 'E', 'L', 0x4147):
+		drm_dbg_driver(dev, "Skip PHY SSC reduction on panel id %X\n", panel_id);
+		link->wa_flags.skip_phy_ssc_reduction = true;
+		break;
+	/*
+	 * Workaround for Apple Studio Display which exposes a 2x1 tiled panel
+	 * over two SST DP links. Hide the secondary tile from userspace so
+	 * compositors drive a single 5K stream on the primary link only.
+	 */
+	case drm_edid_encode_panel_id('A', 'P', 'P', 0xAE3A):
+	case drm_edid_encode_panel_id('A', 'P', 'P', 0xAE42):
+	case drm_edid_encode_panel_id('A', 'P', 'P', 0xAE46):
+		drm_dbg_driver(dev, "Hiding secondary tile on panel id %X\n", panel_id);
+		edid_caps->panel_patch.disable_second_tile = true;
+		break;
 	default:
 		return;
 	}
@@ -108,7 +127,6 @@ enum dc_edid_status dm_helpers_parse_edid_caps(
 {
 	struct amdgpu_dm_connector *aconnector = link->priv;
 	struct drm_connector *connector = &aconnector->base;
-	struct drm_device *dev = connector->dev;
 	struct edid *edid_buf = edid ? (struct edid *) edid->raw_edid : NULL;
 	struct cea_sad *sads;
 	int sad_count = -1;
@@ -142,7 +160,7 @@ enum dc_edid_status dm_helpers_parse_edid_caps(
 	if (edid_caps->edid_hdmi)
 		populate_hdmi_info_from_connector(&connector->display_info.hdmi, edid_caps);
 
-	apply_edid_quirks(dev, edid_buf, edid_caps);
+	apply_edid_quirks(link, edid_buf, edid_caps);
 
 	sad_count = drm_edid_to_sad((struct edid *) edid->raw_edid, &sads);
 	if (sad_count <= 0)
@@ -993,6 +1011,45 @@ dm_helpers_read_acpi_edid(struct amdgpu_dm_connector *aconnector)
 	return drm_edid_read_custom(connector, dm_helpers_probe_acpi_edid, connector);
 }
 
+static const struct drm_edid *
+dm_helpers_read_vbios_hardcoded_edid(struct dc_link *link, struct amdgpu_dm_connector *aconnector)
+{
+	struct dc_bios *bios = link->ctx->dc_bios;
+	struct embedded_panel_info info;
+	const struct drm_edid *edid;
+	enum bp_result r;
+
+	if (!dc_is_embedded_signal(link->connector_signal) ||
+	    !bios->funcs->get_embedded_panel_info)
+		return NULL;
+
+	memset(&info, 0, sizeof(info));
+	r = bios->funcs->get_embedded_panel_info(bios, &info);
+
+	if (r != BP_RESULT_OK) {
+		dm_error("Error when reading embedded panel info: %u\n", r);
+		return NULL;
+	}
+
+	if (!info.fake_edid || !info.fake_edid_size) {
+		dm_error("Embedded panel info doesn't contain an EDID\n");
+		return NULL;
+	}
+
+	edid = drm_edid_alloc(info.fake_edid, info.fake_edid_size);
+
+	if (!drm_edid_valid(edid)) {
+		dm_error("EDID from embedded panel info is invalid\n");
+		drm_edid_free(edid);
+		return NULL;
+	}
+
+	aconnector->base.display_info.width_mm = info.panel_width_mm;
+	aconnector->base.display_info.height_mm = info.panel_height_mm;
+
+	return edid;
+}
+
 void populate_hdmi_info_from_connector(struct drm_hdmi_info *hdmi, struct dc_edid_caps *edid_caps)
 {
 	edid_caps->scdc_present = hdmi->scdc.supported;
@@ -1013,6 +1070,9 @@ enum dc_edid_status dm_helpers_read_local_edid(
 
 	if (link->aux_mode)
 		ddc = &aconnector->dm_dp_aux.aux.ddc;
+	else if (link->ddc_hw_inst == GPIO_DDC_LINE_UNKNOWN &&
+		 dc_is_embedded_signal(link->connector_signal))
+		ddc = NULL;
 	else
 		ddc = &aconnector->i2c->base;
 
@@ -1023,6 +1083,8 @@ enum dc_edid_status dm_helpers_read_local_edid(
 		drm_edid = dm_helpers_read_acpi_edid(aconnector);
 		if (drm_edid)
 			drm_info(connector->dev, "Using ACPI provided EDID for %s\n", connector->name);
+		else if (!ddc)
+			drm_edid = dm_helpers_read_vbios_hardcoded_edid(link, aconnector);
 		else
 			drm_edid = drm_edid_read_ddc(connector, ddc);
 		drm_edid_connector_update(connector, drm_edid);
