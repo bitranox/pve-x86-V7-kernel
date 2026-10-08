@@ -1496,7 +1496,7 @@ static void disable_vbios_mode_if_required(
 
 struct dc *dc_create(const struct dc_init_data *init_params)
 {
-	struct dc *dc = kzalloc_obj(*dc);
+	struct dc *dc = kvzalloc_obj(*dc);
 	unsigned int full_pipe_count;
 
 	if (!dc)
@@ -1544,7 +1544,7 @@ struct dc *dc_create(const struct dc_init_data *init_params)
 
 destruct_dc:
 	dc_destruct(dc);
-	kfree(dc);
+	kvfree(dc);
 	return NULL;
 }
 
@@ -1594,7 +1594,7 @@ void dc_deinit_callbacks(struct dc *dc)
 void dc_destroy(struct dc **dc)
 {
 	dc_destruct(*dc);
-	kfree(*dc);
+	kvfree(*dc);
 	*dc = NULL;
 }
 
@@ -5536,6 +5536,160 @@ void dc_interrupt_ack(struct dc *dc, enum dc_irq_source src)
 	dal_irq_service_ack(dc->res_pool->irqs, src);
 }
 
+/* Preserve this tg if a physical link is still lighting a present display */
+static bool should_preserve_tg(struct dc *dc, struct timing_generator *tg)
+{
+	unsigned int i, j;
+
+	/* Check if a physical link is lighting this tg */
+	for (i = 0; i < dc->link_count; i++) {
+		struct dc_link *link = dc->links[i];
+		int fe;
+
+		if (!link || link->ep_type != DISPLAY_ENDPOINT_PHY ||
+				!link->link_enc ||
+				!link->link_enc->funcs->is_dig_enabled ||
+				!link->link_enc->funcs->is_dig_enabled(link->link_enc) ||
+				!link->link_enc->funcs->get_dig_frontend)
+			continue;
+
+		/* Get the DIG front-end this link's encoder drives; skip if none */
+		fe = link->link_enc->funcs->get_dig_frontend(link->link_enc);
+		if (fe == ENGINE_ID_UNKNOWN)
+			continue;
+
+		/* Find the stream encoder bound to this link's front-end */
+		for (j = 0; j < dc->res_pool->stream_enc_count; j++) {
+			struct stream_encoder *se = dc->res_pool->stream_enc[j];
+
+			/* Skip unless this stream encoder feeds our front-end and drives this tg */
+			if (se->id != fe || !se->funcs->dig_source_otg ||
+					(int)se->funcs->dig_source_otg(se) != tg->inst)
+				continue;
+
+			/* This link drives the OTG: keep a seamless-boot eDP, or
+			 * any external link whose sink is still connected.
+			 */
+			if (link->connector_signal == SIGNAL_TYPE_EDP)
+				return true;
+			if (link->link_enc->funcs->get_hpd_state &&
+					dc->link_srv->get_hpd_state(link))
+				return true;
+		}
+	}
+
+	return false;
+}
+
+/*
+ * GOP/vBIOS may leave an OPTC enabled for a display present at power-on but no
+ * longer driven (e.g. external DP unplugged at boot). Such a dangling pipe keeps
+ * DCN out of idle and blocks s0i3. If nothing needs to survive (no committed
+ * stream or seamless-boot eDP) and no sink is still connected, power down all hw
+ * blocks.
+ */
+void dc_disable_dangling_timing_generators(struct dc *dc)
+{
+	struct dce_hwseq *hws = dc->hwseq;
+	bool any_dangling = false;
+	bool any_preserved = false;
+	bool any_connected = false;
+	unsigned int i;
+
+	/* No real hw to touch on a virtual/emulated environment */
+	if (dc->ctx->dce_environment == DCE_ENV_VIRTUAL_HW)
+		return;
+
+	/* Wake hw out of IPS before reading/touching tg state */
+	dc_exit_ips_for_hw_access(dc);
+
+	/* Classify every enabled tg as either to-preserve or dangling */
+	for (i = 0; i < dc->res_pool->timing_generator_count; i++) {
+		struct timing_generator *tg = dc->res_pool->timing_generators[i];
+
+		if (!tg || !tg->funcs->is_tg_enabled ||
+				!tg->funcs->is_tg_enabled(tg))
+			continue;
+
+		if (should_preserve_tg(dc, tg))
+			any_preserved = true;
+		else
+			any_dangling = true;
+	}
+
+	/* A physically connected sink (HPD asserted) will be re-lit by a
+	 * subsequent atomic commit. For that case we don't call the global
+	 * power_down().
+	 */
+	for (i = 0; i < dc->link_count; i++) {
+		struct dc_link *link = dc->links[i];
+
+		if (link && link->ep_type == DISPLAY_ENDPOINT_PHY &&
+				link->link_enc && link->link_enc->funcs &&
+				link->link_enc->funcs->get_hpd_state &&
+				dc->link_srv->get_hpd_state(link)) {
+			any_connected = true;
+			break;
+		}
+	}
+
+	if (!any_dangling)
+		return;
+
+	if (!any_preserved && !any_connected && hws && hws->funcs.power_down) {
+		/* Truly headless / all sinks unplugged: nothing to preserve */
+		DC_LOG_DC("%s: powering down dangling hw blocks to allow idle\n",
+				__func__);
+		hws->funcs.power_down(dc);
+		return;
+	}
+}
+
+/*
+ * dc_get_flip_pending_on_otg() - Check if a GRPH_FLIP is still pending on OTG
+ *
+ * @dc: display core context @otg_inst: OTG instance to query
+ *
+ * Reads the HUBP flip-pending status for the pipe(s) bound to @otg_inst,
+ * returning true if any of them has not yet latched its programmed surface
+ * address.
+ *
+ * Unlike dc_plane_get_status(), this does not take or mutate a dc_plane_state,
+ * so it is safe to call from interrupt context without racing a concurrent
+ * commit that may be updating plane state.
+ *
+ * Return: true if a flip is still pending on the OTG, false otherwise.
+ */
+bool dc_get_flip_pending_on_otg(struct dc *dc, int otg_inst)
+{
+	bool flip_pending = false;
+	int i;
+
+	if (!dc || !dc->current_state)
+		return false;
+
+	dc_exit_ips_for_hw_access(dc);
+
+	for (i = 0; i < dc->res_pool->pipe_count; i++) {
+		struct pipe_ctx *pipe_ctx = &dc->current_state->res_ctx.pipe_ctx[i];
+		struct hubp *hubp = pipe_ctx->plane_res.hubp;
+
+		if (!pipe_ctx->plane_state || !pipe_ctx->stream_res.tg)
+			continue;
+
+		if (pipe_ctx->stream_res.tg->inst != otg_inst)
+			continue;
+
+		if (hubp && hubp->funcs->hubp_is_flip_pending &&
+		    hubp->funcs->hubp_is_flip_pending(hubp)) {
+			flip_pending = true;
+			break;
+		}
+	}
+
+	return flip_pending;
+}
+
 void dc_power_down_on_boot(struct dc *dc)
 {
 	if (dc->ctx->dce_environment != DCE_ENV_VIRTUAL_HW &&
@@ -5993,7 +6147,11 @@ bool dc_process_dmub_aux_transfer_async(struct dc *dc,
 	uint8_t action;
 	union dmub_rb_cmd cmd = {0};
 
-	ASSERT(payload->length <= 16);
+	if (link_index >= dc->link_count || !dc->links[link_index])
+		return false;
+
+	if (payload->length > sizeof(cmd.dp_aux_access.aux_control.dpaux.data))
+		return false;
 
 	cmd.dp_aux_access.header.type = DMUB_CMD__DP_AUX_ACCESS;
 	cmd.dp_aux_access.header.payload_bytes = 0;

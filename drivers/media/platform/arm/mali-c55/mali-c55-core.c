@@ -663,41 +663,6 @@ static int mali_c55_init_context(struct mali_c55 *mali_c55,
 		      mali_c55->base + config_space_addrs[MALI_C55_CONFIG_PING],
 		      MALI_C55_CONFIG_SPACE_SIZE);
 
-	/*
-	 * Some features of the ISP need to be disabled by default and only
-	 * enabled at the same time as they're configured by a parameters buffer
-	 */
-
-	/* Bypass the sqrt and square compression and expansion modules */
-	mali_c55_ctx_update_bits(mali_c55, MALI_C55_REG_BYPASS_1,
-				 MALI_C55_REG_BYPASS_1_FE_SQRT,
-				 MALI_C55_REG_BYPASS_1_FE_SQRT);
-	mali_c55_ctx_update_bits(mali_c55, MALI_C55_REG_BYPASS_3,
-				 MALI_C55_REG_BYPASS_3_SQUARE_BE,
-				 MALI_C55_REG_BYPASS_3_SQUARE_BE);
-
-	/* Bypass the temper module */
-	mali_c55_ctx_write(mali_c55, MALI_C55_REG_BYPASS_2,
-			   MALI_C55_REG_BYPASS_2_TEMPER);
-
-	/* Disable the temper module's DMA read/write */
-	mali_c55_ctx_write(mali_c55, MALI_C55_REG_TEMPER_DMA_IO, 0x0);
-
-	/* Bypass the colour noise reduction  */
-	mali_c55_ctx_write(mali_c55, MALI_C55_REG_BYPASS_4,
-			   MALI_C55_REG_BYPASS_4_CNR);
-
-	/* Disable the sinter module */
-	mali_c55_ctx_update_bits(mali_c55, MALI_C55_REG_SINTER_CONFIG,
-				 MALI_C55_SINTER_ENABLE_MASK, 0);
-
-	/* Disable the RGB Gamma module for each output */
-	mali_c55_ctx_write(mali_c55, MALI_C55_REG_FR_GAMMA_RGB_ENABLE, 0);
-	mali_c55_ctx_write(mali_c55, MALI_C55_REG_DS_GAMMA_RGB_ENABLE, 0);
-
-	/* Disable the colour correction matrix */
-	mali_c55_ctx_write(mali_c55, MALI_C55_REG_CCM_ENABLE, 0);
-
 	return 0;
 }
 
@@ -734,6 +699,8 @@ static int __mali_c55_power_on(struct mali_c55 *mali_c55)
 					  mali_c55->resets);
 	if (ret) {
 		dev_err(mali_c55->dev, "failed to deassert resets\n");
+		clk_bulk_disable_unprepare(ARRAY_SIZE(mali_c55->clks),
+					   mali_c55->clks);
 		return ret;
 	}
 
@@ -841,8 +808,10 @@ static int mali_c55_probe(struct platform_device *pdev)
 	vb2_dma_contig_set_max_seg_size(dev, UINT_MAX);
 
 	ret = __mali_c55_power_on(mali_c55);
-	if (ret)
-		return dev_err_probe(dev, ret, "failed to power on\n");
+	if (ret) {
+		dev_err_probe(dev, ret, "failed to power on\n");
+		goto err_release_mem;
+	}
 
 	ret = mali_c55_check_hwcfg(mali_c55);
 	if (ret)
@@ -861,7 +830,7 @@ static int mali_c55_probe(struct platform_device *pdev)
 
 	ret = mali_c55_media_frameworks_init(mali_c55);
 	if (ret)
-		goto err_free_context_registers;
+		goto err_pm_runtime_disable;
 
 	pm_runtime_idle(&pdev->dev);
 
@@ -876,11 +845,14 @@ static int mali_c55_probe(struct platform_device *pdev)
 
 err_deinit_media_frameworks:
 	mali_c55_media_frameworks_deinit(mali_c55);
+err_pm_runtime_disable:
+	pm_runtime_set_suspended(&pdev->dev);
 	pm_runtime_disable(&pdev->dev);
-err_free_context_registers:
 	kfree(mali_c55->context.registers);
 err_power_off:
 	__mali_c55_power_off(mali_c55);
+err_release_mem:
+	of_reserved_mem_device_release(dev);
 
 	return ret;
 }
@@ -889,8 +861,14 @@ static void mali_c55_remove(struct platform_device *pdev)
 {
 	struct mali_c55 *mali_c55 = platform_get_drvdata(pdev);
 
-	kfree(mali_c55->context.registers);
 	mali_c55_media_frameworks_deinit(mali_c55);
+	if (!pm_runtime_suspended(&pdev->dev)) {
+		__mali_c55_power_off(mali_c55);
+		pm_runtime_set_suspended(&pdev->dev);
+	}
+	pm_runtime_disable(&pdev->dev);
+	kfree(mali_c55->context.registers);
+	of_reserved_mem_device_release(&pdev->dev);
 }
 
 static const struct of_device_id mali_c55_of_match[] = {

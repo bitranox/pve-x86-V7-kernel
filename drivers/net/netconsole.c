@@ -184,8 +184,10 @@ struct netconsole_target {
 	bool			extended;
 	bool			release;
 	struct netpoll		np;
-	/* protected by target_list_lock */
-	char			buf[MAX_PRINT_CHUNK];
+	/* protected by target_list_lock; +1 gives scnprintf() room for its
+	 * NUL terminator so a full MAX_PRINT_CHUNK payload is not truncated
+	 */
+	char			buf[MAX_PRINT_CHUNK + 1];
 	struct work_struct	resume_wq;
 };
 
@@ -497,6 +499,8 @@ static void trim_newline(char *s, size_t maxlen)
 	size_t len;
 
 	len = strnlen(s, maxlen);
+	if (!len)
+		return;
 	if (s[len - 1] == '\n')
 		s[len - 1] = '\0';
 }
@@ -750,7 +754,7 @@ static ssize_t enabled_store(struct config_item *item,
 		unregister_netcons_consoles();
 	}
 
-	ret = strnlen(buf, count);
+	ret = count;
 	/* Deferred cleanup */
 	netconsole_process_cleanups();
 out_unlock:
@@ -779,7 +783,7 @@ static ssize_t release_store(struct config_item *item, const char *buf,
 
 	nt->release = release;
 
-	ret = strnlen(buf, count);
+	ret = count;
 out_unlock:
 	dynamic_netconsole_mutex_unlock();
 	return ret;
@@ -805,7 +809,7 @@ static ssize_t extended_store(struct config_item *item, const char *buf,
 		goto out_unlock;
 
 	nt->extended = extended;
-	ret = strnlen(buf, count);
+	ret = count;
 out_unlock:
 	dynamic_netconsole_mutex_unlock();
 	return ret;
@@ -815,6 +819,13 @@ static ssize_t dev_name_store(struct config_item *item, const char *buf,
 		size_t count)
 {
 	struct netconsole_target *nt = to_target(item);
+	size_t len = count;
+
+	/* Account for a trailing newline appended by tools like echo */
+	if (len && buf[len - 1] == '\n')
+		len--;
+	if (len >= IFNAMSIZ)
+		return -ENAMETOOLONG;
 
 	dynamic_netconsole_mutex_lock();
 	if (nt->state == STATE_ENABLED) {
@@ -828,7 +839,7 @@ static ssize_t dev_name_store(struct config_item *item, const char *buf,
 	trim_newline(nt->np.dev_name, IFNAMSIZ);
 
 	dynamic_netconsole_mutex_unlock();
-	return strnlen(buf, count);
+	return count;
 }
 
 static ssize_t local_port_store(struct config_item *item, const char *buf,
@@ -847,7 +858,7 @@ static ssize_t local_port_store(struct config_item *item, const char *buf,
 	ret = kstrtou16(buf, 10, &nt->np.local_port);
 	if (ret < 0)
 		goto out_unlock;
-	ret = strnlen(buf, count);
+	ret = count;
 out_unlock:
 	dynamic_netconsole_mutex_unlock();
 	return ret;
@@ -869,7 +880,7 @@ static ssize_t remote_port_store(struct config_item *item,
 	ret = kstrtou16(buf, 10, &nt->np.remote_port);
 	if (ret < 0)
 		goto out_unlock;
-	ret = strnlen(buf, count);
+	ret = count;
 out_unlock:
 	dynamic_netconsole_mutex_unlock();
 	return ret;
@@ -894,7 +905,7 @@ static ssize_t local_ip_store(struct config_item *item, const char *buf,
 		goto out_unlock;
 	nt->np.ipv6 = !!ipv6;
 
-	ret = strnlen(buf, count);
+	ret = count;
 out_unlock:
 	dynamic_netconsole_mutex_unlock();
 	return ret;
@@ -919,7 +930,7 @@ static ssize_t remote_ip_store(struct config_item *item, const char *buf,
 		goto out_unlock;
 	nt->np.ipv6 = !!ipv6;
 
-	ret = strnlen(buf, count);
+	ret = count;
 out_unlock:
 	dynamic_netconsole_mutex_unlock();
 	return ret;
@@ -955,7 +966,7 @@ static ssize_t remote_mac_store(struct config_item *item, const char *buf,
 		goto out_unlock;
 	memcpy(nt->np.remote_mac, remote_mac, ETH_ALEN);
 
-	ret = strnlen(buf, count);
+	ret = count;
 out_unlock:
 	dynamic_netconsole_mutex_unlock();
 	return ret;
@@ -1070,26 +1081,30 @@ static ssize_t userdatum_value_store(struct config_item *item, const char *buf,
 				     size_t count)
 {
 	struct userdatum *udm = to_userdatum(item);
+	char old_value[MAX_EXTRADATA_VALUE_LEN];
 	struct netconsole_target *nt;
 	struct userdata *ud;
 	ssize_t ret;
 
-	if (count > MAX_EXTRADATA_VALUE_LEN)
+	if (count >= MAX_EXTRADATA_VALUE_LEN)
 		return -EMSGSIZE;
 
 	mutex_lock(&netconsole_subsys.su_mutex);
 	dynamic_netconsole_mutex_lock();
-
-	ret = strscpy(udm->value, buf, sizeof(udm->value));
-	if (ret < 0)
-		goto out_unlock;
+	/* Snapshot for rollback if update_userdata() fails below */
+	strscpy(old_value, udm->value, sizeof(old_value));
+	/* count is bounded above, so strscpy() cannot truncate here */
+	strscpy(udm->value, buf, sizeof(udm->value));
 	trim_newline(udm->value, sizeof(udm->value));
 
 	ud = to_userdata(item->ci_parent);
 	nt = userdata_to_target(ud);
 	ret = update_userdata(nt);
-	if (ret < 0)
+	if (ret < 0) {
+		/* Restore the previous value so it matches the live payload */
+		strscpy(udm->value, old_value, sizeof(udm->value));
 		goto out_unlock;
+	}
 	ret = count;
 out_unlock:
 	dynamic_netconsole_mutex_unlock();
@@ -1131,7 +1146,7 @@ static ssize_t sysdata_msgid_enabled_store(struct config_item *item,
 		disable_sysdata_feature(nt, SYSDATA_MSGID);
 
 unlock_ok:
-	ret = strnlen(buf, count);
+	ret = count;
 	dynamic_netconsole_mutex_unlock();
 	mutex_unlock(&netconsole_subsys.su_mutex);
 	return ret;
@@ -1160,7 +1175,7 @@ static ssize_t sysdata_release_enabled_store(struct config_item *item,
 		disable_sysdata_feature(nt, SYSDATA_RELEASE);
 
 unlock_ok:
-	ret = strnlen(buf, count);
+	ret = count;
 	dynamic_netconsole_mutex_unlock();
 	mutex_unlock(&netconsole_subsys.su_mutex);
 	return ret;
@@ -1189,7 +1204,7 @@ static ssize_t sysdata_taskname_enabled_store(struct config_item *item,
 		disable_sysdata_feature(nt, SYSDATA_TASKNAME);
 
 unlock_ok:
-	ret = strnlen(buf, count);
+	ret = count;
 	dynamic_netconsole_mutex_unlock();
 	mutex_unlock(&netconsole_subsys.su_mutex);
 	return ret;
@@ -1223,7 +1238,7 @@ static ssize_t sysdata_cpu_nr_enabled_store(struct config_item *item,
 		disable_sysdata_feature(nt, SYSDATA_CPU_NR);
 
 unlock_ok:
-	ret = strnlen(buf, count);
+	ret = count;
 	dynamic_netconsole_mutex_unlock();
 	mutex_unlock(&netconsole_subsys.su_mutex);
 	return ret;
@@ -1679,7 +1694,7 @@ static void send_msg_no_fragmentation(struct netconsole_target *nt,
 	if (release_len) {
 		release = init_utsname()->release;
 
-		scnprintf(nt->buf, MAX_PRINT_CHUNK, "%s,%.*s", release,
+		scnprintf(nt->buf, sizeof(nt->buf), "%s,%.*s", release,
 			  msg_len, msg);
 		msg_len += release_len;
 	} else {
@@ -1688,12 +1703,12 @@ static void send_msg_no_fragmentation(struct netconsole_target *nt,
 
 	if (userdata)
 		msg_len += scnprintf(&nt->buf[msg_len],
-				     MAX_PRINT_CHUNK - msg_len, "%s",
+				     sizeof(nt->buf) - msg_len, "%s",
 				     userdata);
 
 	if (sysdata)
 		msg_len += scnprintf(&nt->buf[msg_len],
-				     MAX_PRINT_CHUNK - msg_len, "%s",
+				     sizeof(nt->buf) - msg_len, "%s",
 				     sysdata);
 
 	send_udp(nt, nt->buf, msg_len);

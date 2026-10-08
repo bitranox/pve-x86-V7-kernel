@@ -477,17 +477,17 @@ static __cold noinline void io_queue_deferred(struct io_ring_ctx *ctx)
 
 void __io_commit_cqring_flush(struct io_ring_ctx *ctx)
 {
-	if (ctx->poll_activated)
+	if (ctx->int_flags & IO_RING_F_POLL_ACTIVATED)
 		io_poll_wq_wake(ctx);
-	if (ctx->off_timeout_used)
+	if (ctx->int_flags & IO_RING_F_OFF_TIMEOUT_USED)
 		io_flush_timeouts(ctx);
-	if (ctx->has_evfd)
-		io_eventfd_signal(ctx, true);
+	if (ctx->int_flags & IO_RING_F_HAS_EVFD)
+		io_eventfd_signal(ctx, true, false);
 }
 
 static inline void __io_cq_lock(struct io_ring_ctx *ctx)
 {
-	if (!ctx->lockless_cq)
+	if (!(ctx->int_flags & IO_RING_F_LOCKLESS_CQ))
 		spin_lock(&ctx->completion_lock);
 }
 
@@ -500,11 +500,11 @@ static inline void io_cq_lock(struct io_ring_ctx *ctx)
 static inline void __io_cq_unlock_post(struct io_ring_ctx *ctx)
 {
 	io_commit_cqring(ctx);
-	if (!ctx->task_complete) {
-		if (!ctx->lockless_cq)
+	if (!(ctx->int_flags & IO_RING_F_TASK_COMPLETE)) {
+		if (!(ctx->int_flags & IO_RING_F_LOCKLESS_CQ))
 			spin_unlock(&ctx->completion_lock);
 		/* IOPOLL rings only need to wake up if it's also SQPOLL */
-		if (!ctx->syscall_iopoll)
+		if (!(ctx->int_flags & IO_RING_F_SYSCALL_IOPOLL))
 			io_cqring_wake(ctx);
 	}
 	io_commit_cqring_flush(ctx);
@@ -830,7 +830,7 @@ bool io_post_aux_cqe(struct io_ring_ctx *ctx, u64 user_data, s32 res, u32 cflags
 void io_add_aux_cqe(struct io_ring_ctx *ctx, u64 user_data, s32 res, u32 cflags)
 {
 	lockdep_assert_held(&ctx->uring_lock);
-	lockdep_assert(ctx->lockless_cq);
+	lockdep_assert(ctx->int_flags & IO_RING_F_LOCKLESS_CQ);
 
 	if (!io_fill_cqe_aux(ctx, user_data, res, cflags)) {
 		struct io_cqe cqe = io_init_cqe(user_data, res, cflags);
@@ -860,7 +860,7 @@ bool io_req_post_cqe(struct io_kiocb *req, s32 res, u32 cflags)
 	lockdep_assert(!io_wq_current_is_worker());
 	lockdep_assert_held(&ctx->uring_lock);
 
-	if (!ctx->lockless_cq) {
+	if (!(ctx->int_flags & IO_RING_F_LOCKLESS_CQ)) {
 		spin_lock(&ctx->completion_lock);
 		posted = io_fill_cqe_aux(ctx, req->cqe.user_data, res, cflags);
 		spin_unlock(&ctx->completion_lock);
@@ -885,7 +885,7 @@ bool io_req_post_cqe32(struct io_kiocb *req, struct io_uring_cqe cqe[2])
 	lockdep_assert_held(&ctx->uring_lock);
 
 	cqe[0].user_data = req->cqe.user_data;
-	if (!ctx->lockless_cq) {
+	if (!(ctx->int_flags & IO_RING_F_LOCKLESS_CQ)) {
 		spin_lock(&ctx->completion_lock);
 		posted = io_fill_cqe_aux32(ctx, cqe);
 		spin_unlock(&ctx->completion_lock);
@@ -913,7 +913,7 @@ static void io_req_complete_post(struct io_kiocb *req, unsigned issue_flags)
 	 * Handle special CQ sync cases via task_work. DEFER_TASKRUN requires
 	 * the submitter task context, IOPOLL protects with uring_lock.
 	 */
-	if (ctx->lockless_cq || (req->flags & REQ_F_REISSUE)) {
+	if ((ctx->int_flags & IO_RING_F_LOCKLESS_CQ) || (req->flags & REQ_F_REISSUE)) {
 defer_complete:
 		req->io_task_work.func = io_req_task_complete;
 		io_req_task_work_add(req);
@@ -1135,7 +1135,7 @@ void __io_submit_flush_completions(struct io_ring_ctx *ctx)
 		 */
 		if (!(req->flags & (REQ_F_CQE_SKIP | REQ_F_REISSUE)) &&
 		    unlikely(!io_fill_cqe_req(ctx, req))) {
-			if (ctx->lockless_cq)
+			if (ctx->int_flags & IO_RING_F_LOCKLESS_CQ)
 				io_cqe_overflow(ctx, &req->cqe, &req->big_cqe);
 			else
 				io_cqe_overflow_locked(ctx, &req->cqe, &req->big_cqe);
@@ -1148,7 +1148,7 @@ void __io_submit_flush_completions(struct io_ring_ctx *ctx)
 		INIT_WQ_LIST(&state->compl_reqs);
 	}
 
-	if (unlikely(ctx->drain_active))
+	if (unlikely(ctx->int_flags & IO_RING_F_DRAIN_ACTIVE))
 		io_queue_deferred(ctx);
 
 	ctx->submit_state.cq_flush = false;
@@ -1344,7 +1344,7 @@ static __cold void io_drain_req(struct io_kiocb *req)
 	list_add_tail(&de->list, &ctx->defer_list);
 	io_queue_deferred(ctx);
 	if (!drain && list_empty(&ctx->defer_list))
-		ctx->drain_active = false;
+		ctx->int_flags &= ~IO_RING_F_DRAIN_ACTIVE;
 }
 
 static bool io_assign_file(struct io_kiocb *req, const struct io_issue_def *def,
@@ -1655,7 +1655,7 @@ static void io_queue_sqe_fallback(struct io_kiocb *req)
 	} else {
 		/* can't fail with IO_URING_F_INLINE */
 		io_req_sqe_copy(req, IO_URING_F_INLINE);
-		if (unlikely(req->ctx->drain_active))
+		if (unlikely(req->ctx->int_flags & IO_RING_F_DRAIN_ACTIVE))
 			io_drain_req(req);
 		else
 			io_queue_iowq(req);
@@ -1671,7 +1671,7 @@ static inline bool io_check_restriction(struct io_ring_ctx *ctx,
 					struct io_kiocb *req,
 					unsigned int sqe_flags)
 {
-	if (!ctx->op_restricted)
+	if (!(ctx->int_flags & IO_RING_F_OP_RESTRICTED))
 		return true;
 	if (!test_bit(req->opcode, ctx->restrictions.sqe_op))
 		return false;
@@ -1691,7 +1691,7 @@ static void io_init_drain(struct io_ring_ctx *ctx)
 {
 	struct io_kiocb *head = ctx->submit_state.link.head;
 
-	ctx->drain_active = true;
+	ctx->int_flags |= IO_RING_F_DRAIN_ACTIVE;
 	if (head) {
 		/*
 		 * If we need to drain a request in the middle of a link, drain
@@ -1701,7 +1701,7 @@ static void io_init_drain(struct io_ring_ctx *ctx)
 		 * link.
 		 */
 		head->flags |= REQ_F_IO_DRAIN | REQ_F_FORCE_ASYNC;
-		ctx->drain_next = true;
+		ctx->int_flags |= IO_RING_F_DRAIN_NEXT;
 	}
 }
 
@@ -1719,10 +1719,9 @@ static int io_init_req(struct io_ring_ctx *ctx, struct io_kiocb *req,
 	const struct io_issue_def *def;
 	unsigned int sqe_flags;
 	int personality;
-	u8 opcode;
 
 	req->ctx = ctx;
-	req->opcode = opcode = READ_ONCE(sqe->opcode);
+	req->opcode = READ_ONCE(sqe->opcode);
 	/* same numerical values with corresponding REQ_F_*, safe to copy */
 	sqe_flags = READ_ONCE(sqe->flags);
 	req->flags = (__force io_req_flags_t) sqe_flags;
@@ -1732,13 +1731,13 @@ static int io_init_req(struct io_ring_ctx *ctx, struct io_kiocb *req,
 	req->cancel_seq_set = false;
 	req->async_data = NULL;
 
-	if (unlikely(opcode >= IORING_OP_LAST)) {
+	if (unlikely(req->opcode >= IORING_OP_LAST)) {
 		req->opcode = 0;
 		return io_init_fail_req(req, -EINVAL);
 	}
-	opcode = array_index_nospec(opcode, IORING_OP_LAST);
+	req->opcode = array_index_nospec(req->opcode, IORING_OP_LAST);
 
-	def = &io_issue_defs[opcode];
+	def = &io_issue_defs[req->opcode];
 	if (def->is_128 && !(ctx->flags & IORING_SETUP_SQE128)) {
 		/*
 		 * A 128b op on a non-128b SQ requires mixed SQE support as
@@ -1767,23 +1766,23 @@ static int io_init_req(struct io_ring_ctx *ctx, struct io_kiocb *req,
 			req->buf_index = READ_ONCE(sqe->buf_group);
 		}
 		if (sqe_flags & IOSQE_CQE_SKIP_SUCCESS)
-			ctx->drain_disabled = true;
+			ctx->int_flags |= IO_RING_F_DRAIN_DISABLED;
 		if (sqe_flags & IOSQE_IO_DRAIN) {
-			if (ctx->drain_disabled)
+			if (ctx->int_flags & IO_RING_F_DRAIN_DISABLED)
 				return io_init_fail_req(req, -EOPNOTSUPP);
 			io_init_drain(ctx);
 		}
 	}
-	if (unlikely(ctx->op_restricted || ctx->drain_active || ctx->drain_next)) {
+	if (unlikely(ctx->int_flags & (IO_RING_F_OP_RESTRICTED | IO_RING_F_DRAIN_ACTIVE | IO_RING_F_DRAIN_NEXT))) {
 		if (!io_check_restriction(ctx, req, sqe_flags))
 			return io_init_fail_req(req, -EACCES);
 		/* knock it to the slow queue path, will be drained there */
-		if (ctx->drain_active)
+		if (ctx->int_flags & IO_RING_F_DRAIN_ACTIVE)
 			req->flags |= REQ_F_FORCE_ASYNC;
 		/* if there is no link, we're at "next" request and need to drain */
-		if (unlikely(ctx->drain_next) && !ctx->submit_state.link.head) {
-			ctx->drain_next = false;
-			ctx->drain_active = true;
+		if (unlikely(ctx->int_flags & IO_RING_F_DRAIN_NEXT) && !ctx->submit_state.link.head) {
+			ctx->int_flags &= ~IO_RING_F_DRAIN_NEXT;
+			ctx->int_flags |= IO_RING_F_DRAIN_ACTIVE;
 			req->flags |= REQ_F_IO_DRAIN | REQ_F_FORCE_ASYNC;
 		}
 	}
@@ -2204,7 +2203,7 @@ static __cold void io_activate_pollwq_cb(struct callback_head *cb)
 					       poll_wq_task_work);
 
 	mutex_lock(&ctx->uring_lock);
-	ctx->poll_activated = true;
+	ctx->int_flags |= IO_RING_F_POLL_ACTIVATED;
 	mutex_unlock(&ctx->uring_lock);
 
 	/*
@@ -2219,9 +2218,9 @@ __cold void io_activate_pollwq(struct io_ring_ctx *ctx)
 {
 	spin_lock(&ctx->completion_lock);
 	/* already activated or in progress */
-	if (ctx->poll_activated || ctx->poll_wq_task_work.func)
+	if ((ctx->int_flags & IO_RING_F_POLL_ACTIVATED) || ctx->poll_wq_task_work.func)
 		goto out;
-	if (WARN_ON_ONCE(!ctx->task_complete))
+	if (WARN_ON_ONCE(!(ctx->int_flags & IO_RING_F_TASK_COMPLETE)))
 		goto out;
 	if (!ctx->submitter_task)
 		goto out;
@@ -2242,7 +2241,7 @@ static __poll_t io_uring_poll(struct file *file, poll_table *wait)
 	struct io_ring_ctx *ctx = file->private_data;
 	__poll_t mask = 0;
 
-	if (unlikely(!ctx->poll_activated))
+	if (unlikely(!(ctx->int_flags & IO_RING_F_POLL_ACTIVATED)))
 		io_activate_pollwq(ctx);
 	/*
 	 * provides mb() which pairs with barrier from wq_has_sleeper
@@ -2307,6 +2306,10 @@ static __cold void io_ring_exit_work(struct work_struct *work)
 	struct io_tctx_exit exit;
 	struct io_tctx_node *node;
 	int ret;
+
+	mutex_lock(&ctx->uring_lock);
+	io_terminate_zcrx(ctx);
+	mutex_unlock(&ctx->uring_lock);
 
 	/*
 	 * If we're doing polled IO and end up having requests being
@@ -2392,8 +2395,8 @@ static __cold void io_ring_exit_work(struct work_struct *work)
 	spin_lock(&ctx->completion_lock);
 	spin_unlock(&ctx->completion_lock);
 
-	/* pairs with RCU read section in io_req_local_work_add() */
-	if (ctx->flags & IORING_SETUP_DEFER_TASKRUN)
+	/* pairs with the RCU read sections in the task_work add paths */
+	if (ctx->flags & (IORING_SETUP_DEFER_TASKRUN | IORING_SETUP_SQPOLL))
 		synchronize_rcu();
 
 	io_ring_ctx_free(ctx);
@@ -2610,7 +2613,7 @@ SYSCALL_DEFINE6(io_uring_enter, unsigned int, fd, u32, to_submit,
 			goto out;
 		}
 		if (flags & IORING_ENTER_GETEVENTS) {
-			if (ctx->syscall_iopoll)
+			if (ctx->int_flags & IO_RING_F_SYSCALL_IOPOLL)
 				goto iopoll_locked;
 			/*
 			 * Ignore errors, we'll soon call io_cqring_wait() and
@@ -2625,7 +2628,7 @@ SYSCALL_DEFINE6(io_uring_enter, unsigned int, fd, u32, to_submit,
 	if (flags & IORING_ENTER_GETEVENTS) {
 		int ret2;
 
-		if (ctx->syscall_iopoll) {
+		if (ctx->int_flags & IO_RING_F_SYSCALL_IOPOLL) {
 			/*
 			 * We disallow the app entering submit/complete with
 			 * polling, but we still need to lock the ring to
@@ -2926,9 +2929,9 @@ static void io_ctx_restriction_clone(struct io_ring_ctx *ctx,
 	if (dst->bpf_filters)
 		WRITE_ONCE(ctx->bpf_filters, dst->bpf_filters->filters);
 	if (dst->op_registered)
-		ctx->op_restricted = 1;
+		ctx->int_flags |= IO_RING_F_OP_RESTRICTED;
 	if (dst->reg_registered)
-		ctx->reg_restricted = 1;
+		ctx->int_flags |= IO_RING_F_REG_RESTRICTED;
 }
 
 static __cold int io_uring_create(struct io_ctx_config *config)
@@ -2955,17 +2958,18 @@ static __cold int io_uring_create(struct io_ctx_config *config)
 
 	if ((ctx->flags & IORING_SETUP_DEFER_TASKRUN) &&
 	    !(ctx->flags & IORING_SETUP_IOPOLL))
-		ctx->task_complete = true;
+		ctx->int_flags |= IO_RING_F_TASK_COMPLETE;
 
-	if (ctx->task_complete || (ctx->flags & IORING_SETUP_IOPOLL))
-		ctx->lockless_cq = true;
+	if ((ctx->int_flags & IO_RING_F_TASK_COMPLETE) ||
+	    (ctx->flags & IORING_SETUP_IOPOLL))
+		ctx->int_flags |= IO_RING_F_LOCKLESS_CQ;
 
 	/*
 	 * lazy poll_wq activation relies on ->task_complete for synchronisation
 	 * purposes, see io_activate_pollwq()
 	 */
-	if (!ctx->task_complete)
-		ctx->poll_activated = true;
+	if (!(ctx->int_flags & IO_RING_F_TASK_COMPLETE))
+		ctx->int_flags |= IO_RING_F_POLL_ACTIVATED;
 
 	/*
 	 * When SETUP_IOPOLL and SETUP_SQPOLL are both enabled, user
@@ -2975,9 +2979,10 @@ static __cold int io_uring_create(struct io_ctx_config *config)
 	 */
 	if (ctx->flags & IORING_SETUP_IOPOLL &&
 	    !(ctx->flags & IORING_SETUP_SQPOLL))
-		ctx->syscall_iopoll = 1;
+		ctx->int_flags |= IO_RING_F_SYSCALL_IOPOLL;
 
-	ctx->compat = in_compat_syscall();
+	if (in_compat_syscall())
+		ctx->int_flags |= IO_RING_F_COMPAT;
 	if (!ns_capable_noaudit(&init_user_ns, CAP_IPC_LOCK))
 		ctx->user = get_uid(current_user());
 

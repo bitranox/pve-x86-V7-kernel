@@ -807,7 +807,7 @@ static void test_sockmap_many_socket(void)
 		return;
 	}
 
-	udp = xsocket(AF_INET, SOCK_DGRAM | SOCK_NONBLOCK, 0);
+	udp = socket_loopback(AF_INET, SOCK_DGRAM | SOCK_NONBLOCK);
 	if (udp < 0) {
 		close(dgram);
 		close(tcp);
@@ -876,7 +876,7 @@ static void test_sockmap_many_maps(void)
 		return;
 	}
 
-	udp = xsocket(AF_INET, SOCK_DGRAM | SOCK_NONBLOCK, 0);
+	udp = socket_loopback(AF_INET, SOCK_DGRAM | SOCK_NONBLOCK);
 	if (udp < 0) {
 		close(dgram);
 		close(tcp);
@@ -947,7 +947,7 @@ static void test_sockmap_same_sock(void)
 		return;
 	}
 
-	udp = xsocket(AF_INET, SOCK_DGRAM | SOCK_NONBLOCK, 0);
+	udp = socket_loopback(AF_INET, SOCK_DGRAM | SOCK_NONBLOCK);
 	if (udp < 0) {
 		close(dgram);
 		close(tcp);
@@ -1298,10 +1298,23 @@ static void test_sockmap_multi_channels(int sotype)
 	avail = wait_for_fionread(p1, expected, IO_TIMEOUT_SEC);
 	ASSERT_EQ(avail, expected, "ioctl(FIONREAD) full return");
 
-	recvd = recv_timeout(p1, rcv, sizeof(rcv), MSG_DONTWAIT, 1);
-	if (!ASSERT_EQ(recvd, sizeof(buf), "recv_timeout(p1)") ||
+	recvd = recv_timeout(p1, rcv, expected, MSG_DONTWAIT, 1);
+	if (!ASSERT_EQ(recvd, expected, "recv_timeout(p1)") ||
 	    !ASSERT_OK(memcmp(buf, rcv, recvd), "data mismatch"))
 		goto end;
+
+	/* process remaining data for udp if secondary data is available */
+	expected = sizeof(buf) - expected;
+	if (expected) {
+		avail = wait_for_fionread(p1, expected, IO_TIMEOUT_SEC);
+		ASSERT_EQ(avail, expected, "second ioctl(FIONREAD) full return");
+
+		recvd = recv_timeout(p1, rcv, expected, MSG_DONTWAIT, 1);
+		if (!ASSERT_EQ(recvd, expected, "second recv_timeout(p1)") ||
+		    !ASSERT_OK(memcmp(buf + sizeof(buf) - expected, rcv, recvd),
+			       "second data mismatch"))
+			goto end;
+	}
 end:
 	if (c0 >= 0)
 		close(c0);
