@@ -3958,7 +3958,8 @@ void ixgbe_configure_tx_ring(struct ixgbe_adapter *adapter,
 	}
 
 	/* initialize XPS */
-	if (!test_and_set_bit(__IXGBE_TX_XPS_INIT_DONE, &ring->state)) {
+	if (!ring_is_xdp(ring) &&
+	    !test_and_set_bit(__IXGBE_TX_XPS_INIT_DONE, &ring->state)) {
 		struct ixgbe_q_vector *q_vector = ring->q_vector;
 
 		if (q_vector)
@@ -4131,7 +4132,7 @@ static void ixgbe_set_rx_drop_en(struct ixgbe_adapter *adapter)
 			ixgbe_disable_rx_drop(adapter, adapter->rx_ring[i]);
 	}
 
-	if (hw->mac.ops.enable_mdd)
+	if (adapter->num_vfs && hw->mac.ops.enable_mdd)
 		hw->mac.ops.enable_mdd(hw);
 }
 

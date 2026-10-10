@@ -1177,6 +1177,7 @@ int ext4_block_write_begin(handle_t *handle, struct folio *folio,
 	int nr_wait = 0;
 	int i;
 	bool should_journal_data = ext4_should_journal_data(inode);
+	bool folio_uptodate = folio_test_uptodate(folio);
 
 	BUG_ON(!folio_test_locked(folio));
 	BUG_ON(to > folio_size(folio));
@@ -1188,13 +1189,13 @@ int ext4_block_write_begin(handle_t *handle, struct folio *folio,
 		head = create_empty_buffers(folio, blocksize, 0);
 	block = EXT4_PG_TO_LBLK(inode, folio->index);
 
-	for (bh = head, block_start = 0; bh != head || !block_start;
+	for (bh = head, block_start = 0;
+	     block_start < to || (!folio_uptodate && bh != head);
 	    block++, block_start = block_end, bh = bh->b_this_page) {
 		block_end = block_start + blocksize;
 		if (block_end <= from || block_start >= to) {
-			if (folio_test_uptodate(folio)) {
+			if (folio_uptodate)
 				set_buffer_uptodate(bh);
-			}
 			continue;
 		}
 		if (WARN_ON_ONCE(buffer_new(bh)))
@@ -1215,7 +1216,7 @@ int ext4_block_write_begin(handle_t *handle, struct folio *folio,
 				if (should_journal_data)
 					do_journal_get_write_access(handle,
 								    inode, bh);
-				if (folio_test_uptodate(folio)) {
+				if (folio_uptodate) {
 					/*
 					 * Unlike __block_write_begin() we leave
 					 * dirtying of new uptodate buffers to
@@ -1232,7 +1233,7 @@ int ext4_block_write_begin(handle_t *handle, struct folio *folio,
 				continue;
 			}
 		}
-		if (folio_test_uptodate(folio)) {
+		if (folio_uptodate) {
 			set_buffer_uptodate(bh);
 			continue;
 		}
@@ -1559,7 +1560,8 @@ static int ext4_journalled_write_end(const struct kiocb *iocb,
 
 	BUG_ON(!ext4_handle_valid(handle));
 
-	if (ext4_has_inline_data(inode))
+	if (ext4_has_inline_data(inode) &&
+	    ext4_test_inode_state(inode, EXT4_STATE_MAY_INLINE_DATA))
 		return ext4_write_inline_data_end(inode, pos, len, copied,
 						  folio);
 
@@ -2680,10 +2682,22 @@ static int mpage_prepare_extent_to_map(struct mpage_da_data *mpd)
 			 * page is already under writeback and we are not doing
 			 * a data integrity writeback, skip the page
 			 */
-			if (!folio_test_dirty(folio) ||
-			    (folio_test_writeback(folio) &&
-			     (mpd->wbc->sync_mode == WB_SYNC_NONE)) ||
+			if ((folio_test_writeback(folio) &&
+			    mpd->wbc->sync_mode == WB_SYNC_NONE) ||
 			    unlikely(folio->mapping != mapping)) {
+				folio_unlock(folio);
+				continue;
+			}
+			/*
+			 * If the folio is clean, skip writing it back.
+			 * Cycle the folio through the writeback state
+			 * though, to clear stale xarray tags.
+			 */
+			if (!folio_test_dirty(folio)) {
+				if (!folio_test_writeback(folio)) {
+					__folio_start_writeback(folio, false);
+					folio_end_writeback(folio);
+				}
 				folio_unlock(folio);
 				continue;
 			}
@@ -2838,10 +2852,10 @@ static int ext4_do_writepages(struct mpage_da_data *mpd)
 	if (ext4_should_dioread_nolock(inode)) {
 		int bpf = ext4_journal_blocks_per_folio(inode);
 		/*
-		 * We may need to convert up to one extent per block in
-		 * the folio and we may dirty the inode.
+		 * We may need to convert up to one extent per block in the
+		 * folio.
 		 */
-		rsv_blocks = 1 + ext4_ext_index_trans_blocks(inode, bpf);
+		rsv_blocks = ext4_meta_trans_blocks(inode, bpf, bpf, 0);
 	}
 
 	if (wbc->range_start == 0 && wbc->range_end == LLONG_MAX)
@@ -3678,8 +3692,8 @@ static int ext4_iomap_alloc(struct inode *inode, struct ext4_map_blocks *map,
 			return ret;
 		if (map->m_len < orig_mlen) {
 			map->m_len = orig_mlen;
-			dio_credits = ext4_meta_trans_blocks(inode, orig_mlen,
-							     map->m_len);
+			dio_credits = ext4_meta_trans_blocks(inode, map->m_len,
+							     map->m_len, 0);
 		} else {
 			dio_credits = ext4_chunk_trans_blocks(inode,
 							      map->m_len);
@@ -6163,17 +6177,17 @@ static int ext4_index_trans_blocks(struct inode *inode, int lblocks,
 }
 
 /*
- * Account for index blocks, block groups bitmaps and block group
- * descriptor blocks if modify datablocks and index blocks
- * worse case, the indexs blocks spread over different block groups
- *
- * If datablocks are discontiguous, they are possible to spread over
- * different block groups too. If they are contiguous, with flexbg,
- * they could still across block group boundary.
- *
- * Also account for superblock, inode, quota and xattr blocks
+ * Calculate number of credits needed in a transaction to:
+ *   * Allocate data blocks from @alloc_extents different groups - note that
+ *     with flexbg a single physical extent can span multiple groups but
+ *     single mballoc request only returns extent within one group.
+ *   * Allocate metatadata (extent tree blocks, indirect blocks) to store
+ *     pointers to @pextents data extents having @lblocks in total.
+ *   * Modify extent tree / indirect block tree, inode, superblock, quota
+ *     tracking, xattr blocks
  */
-int ext4_meta_trans_blocks(struct inode *inode, int lblocks, int pextents)
+int ext4_meta_trans_blocks(struct inode *inode, int lblocks, int pextents,
+			   int alloc_extents)
 {
 	ext4_group_t groups, ngroups = ext4_get_groups_count(inode->i_sb);
 	int gdpblocks;
@@ -6190,7 +6204,7 @@ int ext4_meta_trans_blocks(struct inode *inode, int lblocks, int pextents)
 	 * Now let's see how many group bitmaps and group descriptors need
 	 * to account
 	 */
-	groups = idxblocks + pextents;
+	groups = idxblocks + alloc_extents;
 	gdpblocks = groups;
 	if (groups > ngroups)
 		groups = ngroups;
@@ -6216,7 +6230,7 @@ int ext4_chunk_trans_extent(struct inode *inode, int nrblocks)
 {
 	int ret;
 
-	ret = ext4_meta_trans_blocks(inode, nrblocks, 1);
+	ret = ext4_meta_trans_blocks(inode, nrblocks, 1, 1);
 	/* Account for data blocks for journalled mode */
 	if (ext4_should_journal_data(inode))
 		ret += nrblocks;
@@ -6234,7 +6248,7 @@ int ext4_chunk_trans_extent(struct inode *inode, int nrblocks)
  */
 int ext4_chunk_trans_blocks(struct inode *inode, int nrblocks)
 {
-	return ext4_meta_trans_blocks(inode, nrblocks, 1);
+	return ext4_meta_trans_blocks(inode, nrblocks, 1, 1);
 }
 
 /*
