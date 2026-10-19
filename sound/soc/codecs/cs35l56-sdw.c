@@ -547,11 +547,7 @@ static int cs35l56_sdw_probe(struct sdw_slave *peripheral, const struct sdw_devi
 	/* Start in cache-only until device is enumerated */
 	regcache_cache_only(cs35l56->base.regmap, true);
 
-	ret = cs35l56_common_probe(cs35l56);
-	if (ret != 0)
-		return ret;
-
-	return 0;
+	return cs35l56_common_probe(cs35l56, -EINVAL);
 }
 
 static void cs35l56_sdw_remove(struct sdw_slave *peripheral)
@@ -560,10 +556,11 @@ static void cs35l56_sdw_remove(struct sdw_slave *peripheral)
 
 	/* Disable SoundWire interrupts */
 	cs35l56->sdw_irq_no_unmask = true;
-	cancel_work_sync(&cs35l56->sdw_irq_work);
+	flush_work(&cs35l56->sdw_irq_work);
 	sdw_write_no_pm(peripheral, CS35L56_SDW_GEN_INT_MASK_1, 0);
 	sdw_read_no_pm(peripheral, CS35L56_SDW_GEN_INT_STAT_1);
 	sdw_write_no_pm(peripheral, CS35L56_SDW_GEN_INT_STAT_1, 0xFF);
+	flush_work(&cs35l56->sdw_irq_work);
 
 	cs35l56_remove(cs35l56);
 }
