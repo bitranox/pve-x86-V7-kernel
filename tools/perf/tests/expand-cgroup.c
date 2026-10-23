@@ -27,7 +27,7 @@ static int test_expand_events(struct evlist *evlist)
 
 	TEST_ASSERT_VAL("evlist is empty", !evlist__empty(evlist));
 
-	nr_events = evlist->core.nr_entries;
+	nr_events = evlist__nr_entries(evlist);
 	ev_name = calloc(nr_events, sizeof(*ev_name));
 	if (ev_name == NULL) {
 		pr_debug("memory allocation failure\n");
@@ -53,7 +53,7 @@ static int test_expand_events(struct evlist *evlist)
 	}
 
 	ret = TEST_FAIL;
-	if (evlist->core.nr_entries != nr_events * nr_cgrps) {
+	if (evlist__nr_entries(evlist) != nr_events * nr_cgrps) {
 		pr_debug("event count doesn't match\n");
 		goto out;
 	}
@@ -104,7 +104,7 @@ static int expand_default_events(void)
 	TEST_ASSERT_VAL("failed to get evlist", evlist);
 
 	ret = test_expand_events(evlist);
-	evlist__delete(evlist);
+	evlist__put(evlist);
 	return ret;
 }
 
@@ -131,7 +131,7 @@ static int expand_group_events(void)
 	ret = test_expand_events(evlist);
 out:
 	parse_events_error__exit(&err);
-	evlist__delete(evlist);
+	evlist__put(evlist);
 	return ret;
 }
 
@@ -162,7 +162,7 @@ static int expand_libpfm_events(void)
 
 	ret = test_expand_events(evlist);
 out:
-	evlist__delete(evlist);
+	evlist__put(evlist);
 	return ret;
 }
 
@@ -177,7 +177,8 @@ static int expand_metric_events(void)
 	TEST_ASSERT_VAL("failed to get evlist", evlist);
 
 	pme_test = find_core_metrics_table("testarch", "testcpu");
-	ret = metricgroup__parse_groups_test(evlist, pme_test, metric_str);
+	ret = metricgroup__parse_groups_test(evlist, pme_test, metric_str,
+					     /*cputype_filter=*/false);
 	if (ret < 0) {
 		pr_debug("failed to parse '%s' metric\n", metric_str);
 		goto out;
@@ -186,7 +187,7 @@ static int expand_metric_events(void)
 	ret = test_expand_events(evlist);
 
 out:
-	evlist__delete(evlist);
+	evlist__put(evlist);
 	return ret;
 }
 

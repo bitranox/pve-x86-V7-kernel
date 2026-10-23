@@ -1344,7 +1344,7 @@ static void cleanup_events(struct perf_session *session)
 		zfree(&evsel->priv);
 	}
 
-	evlist__delete(evlist);
+	evlist__put(evlist);
 	session->evlist = NULL;
 }
 
@@ -1412,13 +1412,10 @@ static int process_feature_event(const struct perf_tool *tool,
 	struct convert *c = container_of(tool, struct convert, tool);
 	struct ctf_writer *cw = &c->writer;
 	struct perf_record_header_feature *fe = &event->feat;
+	int ret = perf_event__process_feature(tool, session, event);
 
-	if (event->feat.feat_id < HEADER_LAST_FEATURE) {
-		int ret = perf_event__process_feature(session, event);
-
-		if (ret)
-			return ret;
-	}
+	if (ret)
+		return ret;
 
 	switch (fe->feat_id) {
 	case HEADER_HOSTNAME:

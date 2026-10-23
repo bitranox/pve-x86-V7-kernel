@@ -483,6 +483,7 @@ enum WX_MSCA_CMD_value {
 
 #define WX_VMDQ_4Q_MASK              0x7C
 #define WX_VMDQ_2Q_MASK              0x7E
+#define WX_VMDQ_1Q_MASK              0x7F
 
 /****************** Manageablility Host Interface defines ********************/
 #define WX_HI_MAX_BLOCK_BYTE_LENGTH  256 /* Num of bytes in range */
@@ -1183,6 +1184,7 @@ struct wx_hw_stats {
 };
 
 enum wx_state {
+	WX_STATE_DOWN,
 	WX_STATE_RESETTING,
 	WX_STATE_SWFW_BUSY,
 	WX_STATE_PTP_RUNNING,
@@ -1354,6 +1356,7 @@ struct wx {
 	bool default_up;
 
 	struct wx_hw_stats stats;
+	spinlock_t hw_stats_lock; /* spinlock for accessing to hw stats */
 	u64 tx_busy;
 	u64 non_eop_descs;
 	u64 restart_queue;
@@ -1390,6 +1393,8 @@ struct wx {
 	unsigned long last_overflow_check;
 	unsigned long last_rx_ptp_check;
 	unsigned long ptp_tx_start;
+	/* protects ptp_tx_skb, ptp_tx_start and the in-progress state bit */
+	spinlock_t ptp_tx_lock;
 	seqlock_t hw_tc_lock; /* seqlock for ptp */
 	struct cyclecounter hw_cc;
 	struct timecounter hw_tc;
@@ -1400,10 +1405,11 @@ struct wx {
 
 	struct timer_list service_timer;
 	struct work_struct service_task;
+	struct mutex reset_lock; /* mutex for reset */
 };
 
 #define WX_INTR_ALL (~0ULL)
-#define WX_INTR_Q(i) BIT((i))
+#define WX_INTR_Q(i) BIT_ULL((i))
 
 /* register operations */
 #define wr32(a, reg, value)	writel((value), ((a)->hw_addr + (reg)))
@@ -1476,21 +1482,6 @@ wr32ptp(struct wx *wx, u32 reg, u32 value)
 static inline struct wx *phylink_to_wx(struct phylink_config *config)
 {
 	return container_of(config, struct wx, phylink_config);
-}
-
-static inline int wx_set_state_reset(struct wx *wx)
-{
-	u8 timeout = 50;
-
-	while (test_and_set_bit(WX_STATE_RESETTING, wx->state)) {
-		timeout--;
-		if (!timeout)
-			return -EBUSY;
-
-		usleep_range(1000, 2000);
-	}
-
-	return 0;
 }
 
 static inline unsigned int wx_rx_pg_order(struct wx_ring *ring)

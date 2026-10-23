@@ -47,7 +47,7 @@ void *erofs_bread(struct erofs_buf *buf, erofs_off_t offset, bool need_kmap)
 		return NULL;
 	if (!buf->base)
 		buf->base = kmap_local_page(buf->page);
-	return buf->base + (offset & ~PAGE_MASK);
+	return buf->base + ((buf->off + offset) & ~PAGE_MASK);
 }
 
 int erofs_init_metabuf(struct erofs_buf *buf, struct super_block *sb,
@@ -66,9 +66,7 @@ int erofs_init_metabuf(struct erofs_buf *buf, struct super_block *sb,
 	if (erofs_is_fileio_mode(sbi)) {
 		buf->file = sbi->dif0.file;	/* some fs like FUSE needs it */
 		buf->mapping = buf->file->f_mapping;
-	} else if (erofs_is_fscache_mode(sb))
-		buf->mapping = sbi->dif0.fscache->inode->i_mapping;
-	else
+	} else
 		buf->mapping = sb->s_bdev->bd_mapping;
 	return 0;
 }

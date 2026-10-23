@@ -485,6 +485,9 @@ free_chann:
 
 void xdna_mailbox_free_channel(struct mailbox_channel *mb_chann)
 {
+	if (!mb_chann)
+		return;
+
 	destroy_workqueue(mb_chann->work_q);
 	kfree(mb_chann);
 }
@@ -499,7 +502,7 @@ xdna_mailbox_start_channel(struct mailbox_channel *mb_chann,
 	int ret;
 
 	if (!is_power_of_2(x2i->rb_size) || !is_power_of_2(i2x->rb_size)) {
-		pr_err("Ring buf size must be power of 2");
+		pr_err("Ring buf size must be power of 2\n");
 		return -EINVAL;
 	}
 
@@ -531,6 +534,9 @@ void xdna_mailbox_stop_channel(struct mailbox_channel *mb_chann)
 	struct mailbox_msg *mb_msg;
 	unsigned long msg_id;
 
+	if (!mb_chann)
+		return;
+
 	/* Disable an irq and wait. This might sleep. */
 	free_irq(mb_chann->msix_irq, mb_chann);
 
@@ -538,7 +544,9 @@ void xdna_mailbox_stop_channel(struct mailbox_channel *mb_chann)
 	drain_workqueue(mb_chann->work_q);
 
 	/* We can clean up and release resources */
-	xa_for_each(&mb_chann->chan_xa, msg_id, mb_msg)
+	xa_for_each_start(&mb_chann->chan_xa, msg_id, mb_msg, mb_chann->next_msgid)
+		mailbox_release_msg(mb_chann, mb_msg);
+	xa_for_each_range(&mb_chann->chan_xa, msg_id, mb_msg, 0, mb_chann->next_msgid - 1)
 		mailbox_release_msg(mb_chann, mb_msg);
 	xa_destroy(&mb_chann->chan_xa);
 

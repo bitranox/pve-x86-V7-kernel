@@ -96,8 +96,9 @@ static int evsel__tpebs_start_perf_record(struct evsel *evsel)
 	record_argv[i++] = "-o";
 	record_argv[i++] = PERF_DATA;
 
-	if (!perf_cpu_map__is_any_cpu_or_is_empty(evsel->evlist->core.user_requested_cpus)) {
-		cpu_map__snprint(evsel->evlist->core.user_requested_cpus, cpumap_buf,
+	if (!perf_cpu_map__is_any_cpu_or_is_empty(
+			evlist__core(evsel->evlist)->user_requested_cpus)) {
+		cpu_map__snprint(evlist__core(evsel->evlist)->user_requested_cpus, cpumap_buf,
 				 sizeof(cpumap_buf));
 		record_argv[i++] = "-C";
 		record_argv[i++] = cpumap_buf;
@@ -173,7 +174,7 @@ static bool should_ignore_sample(const struct perf_sample *sample, const struct 
 	if (t->evsel->evlist == NULL)
 		return true;
 
-	workload_pid = t->evsel->evlist->workload.pid;
+	workload_pid = evlist__workload_pid(t->evsel->evlist);
 	if (workload_pid < 0 || workload_pid == sample_pid)
 		return false;
 
@@ -217,15 +218,6 @@ static int process_sample_event(const struct perf_tool *tool __maybe_unused,
 	return 0;
 }
 
-static int process_feature_event(const struct perf_tool *tool __maybe_unused,
-				 struct perf_session *session,
-				 union perf_event *event)
-{
-	if (event->feat.feat_id < HEADER_LAST_FEATURE)
-		return perf_event__process_feature(session, event);
-	return 0;
-}
-
 static void *__sample_reader(void *arg __maybe_unused)
 {
 	struct perf_session *session;
@@ -238,7 +230,7 @@ static void *__sample_reader(void *arg __maybe_unused)
 
 	perf_tool__init(&tool, /*ordered_events=*/false);
 	tool.sample = process_sample_event;
-	tool.feature = process_feature_event;
+	tool.feature = perf_event__process_feature;
 	tool.attr = perf_event__process_attr;
 
 	session = perf_session__new(&data, &tool);
