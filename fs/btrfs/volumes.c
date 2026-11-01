@@ -3016,7 +3016,11 @@ int btrfs_init_new_device(struct btrfs_fs_info *fs_info, const char *device_path
 error_sysfs:
 	btrfs_sysfs_remove_device(device);
 	mutex_lock(&fs_info->fs_devices->device_list_mutex);
+	if (seeding_dev)
+		btrfs_assign_next_active_device(device, seed_devices->latest_dev);
 	mutex_lock(&fs_info->chunk_mutex);
+	if (!list_empty(&device->post_commit_list))
+		list_del_init(&device->post_commit_list);
 	list_del_rcu(&device->dev_list);
 	list_del(&device->dev_alloc_list);
 	fs_info->fs_devices->num_devices--;
@@ -3710,7 +3714,11 @@ static int btrfs_may_alloc_data_chunk(struct btrfs_fs_info *fs_info,
 	u64 chunk_type;
 
 	cache = btrfs_lookup_block_group(fs_info, chunk_offset);
-	ASSERT(cache);
+	if (unlikely(!cache)) {
+		btrfs_err(fs_info, "balance: chunk at bytenr %llu has no corresponding block group",
+			  chunk_offset);
+		return -EUCLEAN;
+	}
 	chunk_type = cache->flags;
 	btrfs_put_block_group(cache);
 
@@ -8457,7 +8465,12 @@ bool btrfs_verify_dev_items(const struct btrfs_fs_info *fs_info)
 
 	mutex_lock(&uuid_mutex);
 	list_for_each_entry(dev, &fs_info->fs_devices->devices, dev_list) {
-		if (!test_bit(BTRFS_DEV_STATE_ITEM_FOUND, &dev->dev_state)) {
+		/*
+		 * Replace target dev item (devid 0) is not inserted into chunk tree.
+		 * So skip the DEV_STATE_ITEM check.
+		 */
+		if (dev->devid != BTRFS_DEV_REPLACE_DEVID &&
+		    !test_bit(BTRFS_DEV_STATE_ITEM_FOUND, &dev->dev_state)) {
 			btrfs_err(fs_info,
 			"devid %llu path %s is registered but not found in chunk tree",
 				  dev->devid, btrfs_dev_name(dev));

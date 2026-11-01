@@ -304,7 +304,7 @@ static void update_core_sched_head_seq(struct task_struct *p)
  * moving them to HIGHPRI_DSQ and then consuming them first. This makes minor
  * difference only when dsp_batch is larger than 1.
  *
- * scx_bpf_dispatch[_vtime]_from_dsq() are allowed both from ops.dispatch() and
+ * scx_bpf_dsq_move[_vtime]() are allowed both from ops.dispatch() and
  * non-rq-lock holding BPF programs. As demonstration, this function is called
  * from qmap_dispatch() and monitor_timerfn().
  */
@@ -529,7 +529,7 @@ static s64 task_qdist(struct task_struct *p)
 bool BPF_STRUCT_OPS(qmap_core_sched_before,
 		    struct task_struct *a, struct task_struct *b)
 {
-	return task_qdist(a) > task_qdist(b);
+	return task_qdist(a) < task_qdist(b);
 }
 
 SEC("tp_btf/sched_switch")

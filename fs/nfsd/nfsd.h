@@ -60,21 +60,6 @@ struct readdir_cd {
 /* Maximum number of operations per session compound */
 #define NFSD_MAX_OPS_PER_COMPOUND	200
 
-struct nfsd_genl_rqstp {
-	struct sockaddr		rq_daddr;
-	struct sockaddr		rq_saddr;
-	unsigned long		rq_flags;
-	ktime_t			rq_stime;
-	__be32			rq_xid;
-	u32			rq_vers;
-	u32			rq_prog;
-	u32			rq_proc;
-
-	/* NFSv4 compound */
-	u32			rq_opcnt;
-	u32			rq_opnum[16];
-};
-
 extern struct svc_program	nfsd_programs[];
 extern const struct svc_version	nfsd_version2, nfsd_version3, nfsd_version4;
 extern struct mutex		nfsd_mutex;
@@ -342,13 +327,14 @@ void		nfsd_lockd_shutdown(void);
 #define nfserr_noxattr			cpu_to_be32(NFS4ERR_NOXATTR)
 
 /*
- * Error codes for internal use.  We use enum to choose numbers that are
- * not already assigned, then covert to be32 resulting in a number that
- * cannot conflict with any existing be32 nfserr value.
+ * Error codes for internal use.  These are based at an impossible
+ * nfsstat4 value so that, once converted to be32, they cannot conflict
+ * with any value defined by the protocol (compare the nlm__int__* codes
+ * in fs/lockd/lockd.h).
  */
 enum {
 /* end-of-file indicator in readdir */
-	NFSERR_EOF = NFS4ERR_FIRST_FREE,
+	NFSERR_EOF = 30000,
 #define	nfserr_eof		cpu_to_be32(NFSERR_EOF)
 
 /* replay detected */

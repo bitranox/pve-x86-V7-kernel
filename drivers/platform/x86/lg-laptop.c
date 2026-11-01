@@ -100,6 +100,7 @@ static u32 inited;
 #define INIT_SPARSE_KEYMAP      0x80
 
 static int battery_limit_use_wmbb;
+static bool kbd_backlight_available;
 static struct led_classdev kbd_backlight;
 static enum led_brightness get_kbd_backlight_level(struct device *dev);
 
@@ -214,6 +215,7 @@ static union acpi_object *lg_wmbb(struct device *dev, u32 method_id, u32 arg1, u
 static void wmi_notify(union acpi_object *obj, void *context)
 {
 	long data = (long)context;
+	unsigned int brightness;
 
 	pr_debug("event guid %li\n", data);
 	if (!obj)
@@ -224,8 +226,11 @@ static void wmi_notify(union acpi_object *obj, void *context)
 		struct key_entry *key;
 
 		if (eventcode == 0x10000000) {
-			led_classdev_notify_brightness_hw_changed(
-				&kbd_backlight, get_kbd_backlight_level(kbd_backlight.dev->parent));
+			if (kbd_backlight_available) {
+				brightness = get_kbd_backlight_level(kbd_backlight.dev->parent);
+				led_classdev_notify_brightness_hw_changed(&kbd_backlight,
+									  brightness);
+			}
 		} else {
 			key = sparse_keymap_entry_from_scancode(
 				wmi_input_dev, eventcode);
@@ -269,11 +274,6 @@ static void wmi_input_setup(void)
 	} else {
 		pr_info("Cannot allocate input device");
 	}
-}
-
-static void acpi_notify(struct acpi_device *device, u32 event)
-{
-	acpi_handle_debug(device->handle, "notify: %d\n", event);
 }
 
 static ssize_t fan_mode_store(struct device *dev,
@@ -764,13 +764,13 @@ static void lg_laptop_remove_address_space_handler(void *data)
 					  &lg_laptop_address_space_handler);
 }
 
-static int acpi_add(struct acpi_device *device)
+static int acpi_probe(struct platform_device *pdev)
 {
 	struct platform_device_info pdev_info = {
-		.fwnode = acpi_fwnode_handle(device),
 		.name = PLATFORM_NAME,
 		.id = PLATFORM_DEVID_NONE,
 	};
+	struct acpi_device *device;
 	acpi_status status;
 	int ret;
 	const char *product;
@@ -779,13 +779,19 @@ static int acpi_add(struct acpi_device *device)
 	if (pf_device)
 		return 0;
 
+	device = ACPI_COMPANION(&pdev->dev);
+	if (!device)
+		return -ENODEV;
+
+	pdev_info.fwnode = acpi_fwnode_handle(device),
+
 	status = acpi_install_address_space_handler(device->handle, LG_ADDRESS_SPACE_ID,
 						    &lg_laptop_address_space_handler,
-						    NULL, &device->dev);
+						    NULL, &pdev->dev);
 	if (ACPI_FAILURE(status))
 		return -ENODEV;
 
-	ret = devm_add_action_or_reset(&device->dev, lg_laptop_remove_address_space_handler,
+	ret = devm_add_action_or_reset(&pdev->dev, lg_laptop_remove_address_space_handler,
 				       device);
 	if (ret < 0)
 		return ret;
@@ -864,8 +870,13 @@ static int acpi_add(struct acpi_device *device)
 		goto out_platform_device;
 
 	/* LEDs are optional */
-	led_classdev_register(&pf_device->dev, &kbd_backlight);
-	led_classdev_register(&pf_device->dev, &tpad_led);
+	ret = devm_led_classdev_register(&pdev->dev, &kbd_backlight);
+	if (ret < 0)
+		kbd_backlight_available = false;
+	else
+		kbd_backlight_available = true;
+
+	devm_led_classdev_register(&pdev->dev, &tpad_led);
 
 	wmi_input_setup();
 	battery_hook_register(&battery_hook);
@@ -879,12 +890,9 @@ out_platform_registered:
 	return ret;
 }
 
-static void acpi_remove(struct acpi_device *device)
+static void acpi_remove(struct platform_device *pdev)
 {
 	sysfs_remove_group(&pf_device->dev.kobj, &dev_attribute_group);
-
-	led_classdev_unregister(&tpad_led);
-	led_classdev_unregister(&kbd_backlight);
 
 	battery_hook_unregister(&battery_hook);
 	wmi_input_destroy();
@@ -899,34 +907,13 @@ static const struct acpi_device_id device_ids[] = {
 };
 MODULE_DEVICE_TABLE(acpi, device_ids);
 
-static struct acpi_driver acpi_driver = {
-	.name = "LG Gram Laptop Support",
-	.class = "lg-laptop",
-	.ids = device_ids,
-	.ops = {
-		.add = acpi_add,
-		.remove = acpi_remove,
-		.notify = acpi_notify,
-		},
+static struct platform_driver acpi_driver = {
+	.probe = acpi_probe,
+	.remove = acpi_remove,
+	.driver = {
+		.name = "LG Gram Laptop Support",
+		.acpi_match_table = device_ids,
+	},
 };
 
-static int __init acpi_init(void)
-{
-	int result;
-
-	result = acpi_bus_register_driver(&acpi_driver);
-	if (result < 0) {
-		pr_debug("Error registering driver\n");
-		return -ENODEV;
-	}
-
-	return 0;
-}
-
-static void __exit acpi_exit(void)
-{
-	acpi_bus_unregister_driver(&acpi_driver);
-}
-
-module_init(acpi_init);
-module_exit(acpi_exit);
+module_platform_driver(acpi_driver);

@@ -55,8 +55,7 @@ static void __ib_umem_release(struct ib_device *dev, struct ib_umem *umem, int d
 
 	if (dirty)
 		ib_dma_unmap_sgtable_attrs(dev, &umem->sgt_append.sgt,
-					   DMA_BIDIRECTIONAL,
-					   DMA_ATTR_REQUIRE_COHERENT);
+					   DMA_BIDIRECTIONAL, umem->dma_attrs);
 
 	for_each_sgtable_sg(&umem->sgt_append.sgt, sg, i) {
 		unpin_user_page_range_dirty_lock(sg_page(sg),
@@ -85,14 +84,17 @@ static void __ib_umem_release(struct ib_device *dev, struct ib_umem *umem, int d
  */
 unsigned long ib_umem_find_best_pgsz(struct ib_umem *umem,
 				     unsigned long pgsz_bitmap,
-				     unsigned long virt)
+				     u64 virt)
 {
 	unsigned long curr_len = 0;
 	dma_addr_t curr_base = ~0;
-	unsigned long va, pgoff;
+	unsigned long pgoff;
 	struct scatterlist *sg;
-	dma_addr_t mask;
+	unsigned long mask = 0;
+	unsigned int bits;
 	dma_addr_t end;
+	u64 last_va;
+	u64 va;
 	int i;
 
 	umem->iova = va = virt;
@@ -110,9 +112,12 @@ unsigned long ib_umem_find_best_pgsz(struct ib_umem *umem,
 	 * number of required pages. Compute the largest page size that could
 	 * work based on VA address bits that don't change.
 	 */
-	mask = pgsz_bitmap &
-	       GENMASK(BITS_PER_LONG - 1,
-		       bits_per((umem->length - 1 + virt) ^ virt));
+	if (check_add_overflow(umem->length - 1, virt, &last_va))
+		return 0;
+	bits = bits_per(virt ^ last_va);
+	if (bits < BITS_PER_LONG)
+		mask = pgsz_bitmap & GENMASK(BITS_PER_LONG - 1, bits);
+
 	/* offset into first SGL */
 	pgoff = umem->address & ~PAGE_MASK;
 
@@ -170,7 +175,6 @@ struct ib_umem *ib_umem_get(struct ib_device *device, unsigned long addr,
 	unsigned long lock_limit;
 	unsigned long new_pinned;
 	unsigned long cur_base;
-	unsigned long dma_attr = DMA_ATTR_REQUIRE_COHERENT;
 	struct mm_struct *mm;
 	unsigned long npages;
 	int pinned, ret;
@@ -203,6 +207,10 @@ struct ib_umem *ib_umem_get(struct ib_device *device, unsigned long addr,
 	umem->iova = addr;
 	umem->writable   = ib_access_writable(access);
 	umem->owning_mm = mm = current->mm;
+	umem->dma_attrs = DMA_ATTR_REQUIRE_COHERENT;
+	if (access & IB_ACCESS_RELAXED_ORDERING)
+		umem->dma_attrs |= DMA_ATTR_WEAK_ORDERING;
+
 	mmgrab(mm);
 
 	page_list = (struct page **) __get_free_page(GFP_KERNEL);
@@ -255,11 +263,8 @@ struct ib_umem *ib_umem_get(struct ib_device *device, unsigned long addr,
 		}
 	}
 
-	if (access & IB_ACCESS_RELAXED_ORDERING)
-		dma_attr |= DMA_ATTR_WEAK_ORDERING;
-
 	ret = ib_dma_map_sgtable_attrs(device, &umem->sgt_append.sgt,
-				       DMA_BIDIRECTIONAL, dma_attr);
+				       DMA_BIDIRECTIONAL, umem->dma_attrs);
 	if (ret)
 		goto umem_release;
 	goto out;
@@ -333,3 +338,19 @@ int ib_umem_copy_from(void *dst, struct ib_umem *umem, size_t offset,
 		return 0;
 }
 EXPORT_SYMBOL(ib_umem_copy_from);
+
+/*
+ * Called during rereg mr if the driver is able to re-use a umem for
+ * IB_MR_REREG_ACCESS.
+ */
+int ib_umem_check_rereg(struct ib_umem *umem, int flags, int new_access_flags)
+{
+	if (!umem)
+		return 0;
+
+	if ((flags & IB_MR_REREG_ACCESS) && !(flags & IB_MR_REREG_TRANS))
+		if (ib_access_writable(new_access_flags) && !umem->writable)
+			return -EACCES;
+	return 0;
+}
+EXPORT_SYMBOL(ib_umem_check_rereg);

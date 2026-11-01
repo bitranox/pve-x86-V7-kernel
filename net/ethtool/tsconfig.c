@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only
 
 #include <linux/net_tstamp.h>
+#include <linux/phy.h>
 #include <linux/ptp_clock_kernel.h>
 
 #include "netlink.h"
@@ -41,7 +42,9 @@ static int tsconfig_prepare_data(const struct ethnl_req_info *req_base,
 	struct kernel_hwtstamp_config cfg = {};
 	int ret;
 
-	if (!dev->netdev_ops->ndo_hwtstamp_get)
+	if (!dev->netdev_ops->ndo_hwtstamp_get &&
+	    !phy_is_default_hwtstamp(dev->phydev) &&
+	    !rtnl_dereference(dev->hwprov))
 		return -EOPNOTSUPP;
 
 	ret = ethnl_ops_begin(dev);
@@ -69,8 +72,10 @@ static int tsconfig_prepare_data(const struct ethnl_req_info *req_base,
 		if (ret)
 			goto out;
 
-		if (ts_info.phc_index == -1)
-			return -ENODEV;
+		if (ts_info.phc_index == -1) {
+			ret = -ENODEV;
+			goto out;
+		}
 
 		data->hwprov_desc.index = ts_info.phc_index;
 		data->hwprov_desc.qualifier = ts_info.phc_qualifier;
@@ -224,31 +229,25 @@ static int tsconfig_send_reply(struct net_device *dev, struct genl_info *info)
 	reply_len = ret + ethnl_reply_header_size();
 	rskb = ethnl_reply_init(reply_len, dev, ETHTOOL_MSG_TSCONFIG_SET_REPLY,
 				ETHTOOL_A_TSCONFIG_HEADER, info, &reply_payload);
-	if (!rskb)
+	if (!rskb) {
+		ret = -ENOMEM;
 		goto err_cleanup;
+	}
 
 	ret = tsconfig_fill_reply(rskb, &req_info->base, &reply_data->base);
 	if (ret < 0)
-		goto err_cleanup;
+		goto err_free_msg;
 
 	genlmsg_end(rskb, reply_payload);
 	ret = genlmsg_reply(rskb, info);
+	rskb = NULL;
 
+err_free_msg:
+	nlmsg_free(rskb);
 err_cleanup:
 	kfree(reply_data);
 	kfree(req_info);
 	return ret;
-}
-
-static int ethnl_set_tsconfig_validate(struct ethnl_req_info *req_base,
-				       struct genl_info *info)
-{
-	const struct net_device_ops *ops = req_base->dev->netdev_ops;
-
-	if (!ops->ndo_hwtstamp_set || !ops->ndo_hwtstamp_get)
-		return -EOPNOTSUPP;
-
-	return 1;
 }
 
 static struct hwtstamp_provider *
@@ -264,7 +263,7 @@ tsconfig_set_hwprov_from_desc(struct net_device *dev,
 	int ret;
 
 	ret = ethtool_net_get_ts_info_by_phc(dev, &ts_info, hwprov_desc);
-	if (!ret) {
+	if (!ret && dev->netdev_ops->ndo_hwtstamp_set) {
 		/* Found */
 		source = HWTSTAMP_SOURCE_NETDEV;
 	} else {
@@ -308,6 +307,11 @@ static int ethnl_set_tsconfig(struct ethnl_req_info *req_base,
 
 	if (!netif_device_present(dev))
 		return -ENODEV;
+
+	if (!dev->netdev_ops->ndo_hwtstamp_set &&
+	    !phy_is_default_hwtstamp(dev->phydev) &&
+	    !rtnl_dereference(dev->hwprov))
+		return -EOPNOTSUPP;
 
 	if (tb[ETHTOOL_A_TSCONFIG_HWTSTAMP_PROVIDER]) {
 		struct hwtstamp_provider_desc __hwprov_desc = {.index = -1};
@@ -450,6 +454,5 @@ const struct ethnl_request_ops ethnl_tsconfig_request_ops = {
 	.reply_size		= tsconfig_reply_size,
 	.fill_reply		= tsconfig_fill_reply,
 
-	.set_validate		= ethnl_set_tsconfig_validate,
 	.set			= ethnl_set_tsconfig,
 };

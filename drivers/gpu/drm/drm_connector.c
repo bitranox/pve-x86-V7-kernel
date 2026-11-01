@@ -552,7 +552,7 @@ EXPORT_SYMBOL(drmm_connector_init);
  * @hdmi_funcs: HDMI-related callbacks for this connector
  * @connector_type: user visible type of the connector
  * @ddc: optional pointer to the associated ddc adapter
- * @supported_formats: Bitmask of @hdmi_colorspace listing supported output formats
+ * @supported_formats: Bitmask of @drm_output_color_format listing supported output formats
  * @max_bpc: Maximum bits per char the HDMI connector supports
  *
  * Initialises a preallocated HDMI connector. Connectors can be
@@ -591,10 +591,10 @@ int drmm_connector_hdmi_init(struct drm_device *dev,
 	      connector_type == DRM_MODE_CONNECTOR_HDMIB))
 		return -EINVAL;
 
-	if (!supported_formats || !(supported_formats & BIT(HDMI_COLORSPACE_RGB)))
+	if (!supported_formats || !(supported_formats & BIT(DRM_OUTPUT_COLOR_FORMAT_RGB444)))
 		return -EINVAL;
 
-	if (connector->ycbcr_420_allowed != !!(supported_formats & BIT(HDMI_COLORSPACE_YUV420)))
+	if (connector->ycbcr_420_allowed != !!(supported_formats & BIT(DRM_OUTPUT_COLOR_FORMAT_YCBCR420)))
 		return -EINVAL;
 
 	if (!(max_bpc == 8 || max_bpc == 10 || max_bpc == 12))
@@ -1431,10 +1431,10 @@ drm_hdmi_connector_get_broadcast_rgb_name(enum drm_hdmi_broadcast_rgb broadcast_
 EXPORT_SYMBOL(drm_hdmi_connector_get_broadcast_rgb_name);
 
 static const char * const output_format_str[] = {
-	[HDMI_COLORSPACE_RGB]		= "RGB",
-	[HDMI_COLORSPACE_YUV420]	= "YUV 4:2:0",
-	[HDMI_COLORSPACE_YUV422]	= "YUV 4:2:2",
-	[HDMI_COLORSPACE_YUV444]	= "YUV 4:4:4",
+	[DRM_OUTPUT_COLOR_FORMAT_RGB444]	= "RGB",
+	[DRM_OUTPUT_COLOR_FORMAT_YCBCR420]	= "YUV 4:2:0",
+	[DRM_OUTPUT_COLOR_FORMAT_YCBCR422]	= "YUV 4:2:2",
+	[DRM_OUTPUT_COLOR_FORMAT_YCBCR444]	= "YUV 4:4:4",
 };
 
 /*
@@ -1445,7 +1445,7 @@ static const char * const output_format_str[] = {
  * valid.
  */
 const char *
-drm_hdmi_connector_get_output_format_name(enum hdmi_colorspace fmt)
+drm_hdmi_connector_get_output_format_name(enum drm_output_color_format fmt)
 {
 	if (fmt >= ARRAY_SIZE(output_format_str))
 		return NULL;
@@ -3576,7 +3576,7 @@ EXPORT_SYMBOL(drm_mode_put_tile_group);
 /**
  * drm_mode_get_tile_group - get a reference to an existing tile group
  * @dev: DRM device
- * @topology: 8-bytes unique per monitor.
+ * @topology_id: 9-byte unique ID per monitor.
  *
  * Use the unique bytes to get a reference to an existing tile group.
  *
@@ -3584,14 +3584,14 @@ EXPORT_SYMBOL(drm_mode_put_tile_group);
  * tile group or NULL if not found.
  */
 struct drm_tile_group *drm_mode_get_tile_group(struct drm_device *dev,
-					       const char topology[8])
+					       const char topology_id[9])
 {
 	struct drm_tile_group *tg;
 	int id;
 
 	mutex_lock(&dev->mode_config.idr_mutex);
 	idr_for_each_entry(&dev->mode_config.tile_idr, tg, id) {
-		if (!memcmp(tg->group_data, topology, 8)) {
+		if (!memcmp(tg->group_data, topology_id, sizeof(tg->group_data))) {
 			if (!kref_get_unless_zero(&tg->refcount))
 				tg = NULL;
 			mutex_unlock(&dev->mode_config.idr_mutex);
@@ -3606,7 +3606,7 @@ EXPORT_SYMBOL(drm_mode_get_tile_group);
 /**
  * drm_mode_create_tile_group - create a tile group from a displayid description
  * @dev: DRM device
- * @topology: 8-bytes unique per monitor.
+ * @topology_id: 9-byte unique ID per monitor.
  *
  * Create a tile group for the unique monitor, and get a unique
  * identifier for the tile group.
@@ -3615,7 +3615,7 @@ EXPORT_SYMBOL(drm_mode_get_tile_group);
  * new tile group or NULL.
  */
 struct drm_tile_group *drm_mode_create_tile_group(struct drm_device *dev,
-						  const char topology[8])
+						  const char topology_id[9])
 {
 	struct drm_tile_group *tg;
 	int ret;
@@ -3625,7 +3625,7 @@ struct drm_tile_group *drm_mode_create_tile_group(struct drm_device *dev,
 		return NULL;
 
 	kref_init(&tg->refcount);
-	memcpy(tg->group_data, topology, 8);
+	memcpy(tg->group_data, topology_id, sizeof(tg->group_data));
 	tg->dev = dev;
 
 	mutex_lock(&dev->mode_config.idr_mutex);

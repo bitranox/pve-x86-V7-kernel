@@ -108,8 +108,6 @@ int cs35l56_set_patch(struct cs35l56_base *cs35l56_base)
 EXPORT_SYMBOL_NS_GPL(cs35l56_set_patch, "SND_SOC_CS35L56_SHARED");
 
 static const struct reg_default cs35l56_reg_defaults[] = {
-	/* no defaults for OTP_MEM - first read populates cache */
-
 	{ CS35L56_ASP1_ENABLES1,		0x00000000 },
 	{ CS35L56_ASP1_CONTROL1,		0x00000028 },
 	{ CS35L56_ASP1_CONTROL2,		0x18180200 },
@@ -138,8 +136,6 @@ static const struct reg_default cs35l56_reg_defaults[] = {
 };
 
 static const struct reg_default cs35l63_reg_defaults[] = {
-	/* no defaults for OTP_MEM - first read populates cache */
-
 	{ CS35L56_ASP1_ENABLES1,		0x00000000 },
 	{ CS35L56_ASP1_CONTROL1,		0x00000028 },
 	{ CS35L56_ASP1_CONTROL2,		0x18180200 },
@@ -282,6 +278,9 @@ static bool cs35l56_common_volatile_reg(unsigned int reg)
 	case CS35L56_GLOBAL_ENABLES:		   /* owned by firmware */
 	case CS35L56_BLOCK_ENABLES:		   /* owned by firmware */
 	case CS35L56_BLOCK_ENABLES2:		   /* owned by firmware */
+	case CS35L56_OTP_MEM_53:
+	case CS35L56_OTP_MEM_54:
+	case CS35L56_OTP_MEM_55:
 	case CS35L56_SYNC_GPIO1_CFG ... CS35L56_ASP2_DIO_GPIO13_CFG:
 	case CS35L56_UPDATE_REGS:
 	case CS35L56_REFCLK_INPUT:		   /* owned by firmware */
@@ -535,6 +534,7 @@ static void cs35l56_spi_system_reset(struct cs35l56_base *cs35l56_base)
 	 * The regmap must remain in cache-only until the chip has
 	 * booted, so use a bypassed read.
 	 */
+	val = 0;
 	ret = read_poll_timeout(regmap_read_bypassed, read_ret,
 				(val > 0) && (val < 0xffffffff),
 				CS35L56_HALO_STATE_POLL_US,
@@ -1249,7 +1249,7 @@ ssize_t cs35l56_cal_data_debugfs_write(struct cs35l56_base *cs35l56_base,
 		return -EMSGSIZE;
 
 	ret = simple_write_to_buffer(&cal_data, sizeof(cal_data), ppos, from, count);
-	if (ret)
+	if (ret < 0)
 		return ret;
 
 	ret = cs35l56_stash_calibration(cs35l56_base, &cal_data);
@@ -1283,6 +1283,7 @@ EXPORT_SYMBOL_NS_GPL(cs35l56_create_cal_debugfs, "SND_SOC_CS35L56_SHARED");
 void cs35l56_remove_cal_debugfs(struct cs35l56_base *cs35l56_base)
 {
 	debugfs_remove_recursive(cs35l56_base->debugfs);
+	cs35l56_base->debugfs = ERR_PTR(-ENOENT);
 }
 EXPORT_SYMBOL_NS_GPL(cs35l56_remove_cal_debugfs, "SND_SOC_CS35L56_SHARED");
 

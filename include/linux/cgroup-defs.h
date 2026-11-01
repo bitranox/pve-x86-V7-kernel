@@ -518,7 +518,10 @@ struct cgroup {
 
 	int nr_threaded_children;	/* # of live threaded child cgroups */
 
-	/* sequence number for cgroup.kill, serialized by css_set_lock. */
+	/*
+	 * Sequence number for cgroup.kill. Incremented with both cgroup_mutex
+	 * and css_set_lock held. Readers hold either one.
+	 */
 	unsigned int kill_seq;
 
 	struct kernfs_node *kn;		/* cgroup kernfs entry */
@@ -609,8 +612,8 @@ struct cgroup {
 	/* used to wait for offlining of csses */
 	wait_queue_head_t offline_waitq;
 
-	/* used by cgroup_rmdir() to wait for dying tasks to leave */
-	wait_queue_head_t dying_populated_waitq;
+	/* defers killing csses after removal until cgroup is depopulated */
+	struct work_struct finish_destroy_work;
 
 	/* used to schedule release agent */
 	struct work_struct release_agent_work;

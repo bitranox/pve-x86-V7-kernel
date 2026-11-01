@@ -845,7 +845,13 @@ int bpf_bprintf_prepare(const char *fmt, u32 fmt_size, const u64 *raw_args,
 		data->buf = buffers->buf;
 
 	for (i = 0; i < fmt_size; i++) {
-		if ((!isprint(fmt[i]) && !isspace(fmt[i])) || !isascii(fmt[i])) {
+		unsigned char c = fmt[i];
+
+		/*
+		 * Permit bytes >= 0x80 in plain text so UTF-8 literals can pass
+		 * through unchanged, while still rejecting ASCII control bytes.
+		 */
+		if (isascii(c) && !isprint(c) && !isspace(c)) {
 			err = -EINVAL;
 			goto out;
 		}
@@ -867,6 +873,15 @@ int bpf_bprintf_prepare(const char *fmt, u32 fmt_size, const u64 *raw_args,
 		 * always access fmt[i + 1], in the worst case it will be a 0
 		 */
 		i++;
+		c = fmt[i];
+		/*
+		 * The format parser below only understands ASCII conversion
+		 * specifiers and modifiers, so reject non-ASCII after '%'.
+		 */
+		if (!isascii(c)) {
+			err = -EINVAL;
+			goto out;
+		}
 
 		/* skip optional "[0 +-][num]" width formatting field */
 		while (fmt[i] == '0' || fmt[i] == '+'  || fmt[i] == '-' ||
@@ -2280,6 +2295,7 @@ void bpf_rb_root_free(const struct btf_field *field, void *rb_root,
 		      struct bpf_spin_lock *spin_lock)
 {
 	struct rb_root_cached orig_root, *root = rb_root;
+	struct bpf_rb_node_kern *node;
 	struct rb_node *pos, *n;
 	void *obj;
 
@@ -2288,14 +2304,20 @@ void bpf_rb_root_free(const struct btf_field *field, void *rb_root,
 
 	__bpf_spin_lock_irqsave(spin_lock);
 	orig_root = *root;
+	bpf_rbtree_postorder_for_each_entry_safe(pos, n, &orig_root.rb_root) {
+		node = rb_entry(pos, struct bpf_rb_node_kern, rb_node);
+		WRITE_ONCE(node->owner, BPF_PTR_POISON);
+	}
 	*root = RB_ROOT_CACHED;
 	__bpf_spin_unlock_irqrestore(spin_lock);
 
 	bpf_rbtree_postorder_for_each_entry_safe(pos, n, &orig_root.rb_root) {
 		obj = pos;
 		obj -= field->graph_root.node_offset;
-
-
+		node = rb_entry(pos, struct bpf_rb_node_kern, rb_node);
+		RB_CLEAR_NODE(pos);
+		/* Ensure __bpf_rbtree_add() sees the node as unlinked. */
+		smp_store_release(&node->owner, NULL);
 		__bpf_obj_drop_impl(obj, field->graph_root.value_rec, false);
 	}
 }
@@ -2767,11 +2789,13 @@ __bpf_kfunc struct task_struct *bpf_task_from_vpid(s32 vpid)
 {
 	struct task_struct *p;
 
-	rcu_read_lock();
+	guard(rcu)();
+	if (!task_active_pid_ns(current))
+		return NULL;
+
 	p = find_task_by_vpid(vpid);
 	if (p)
 		p = bpf_task_acquire(p);
-	rcu_read_unlock();
 
 	return p;
 }
@@ -3151,11 +3175,14 @@ __bpf_kfunc void bpf_throw(u64 cookie)
 		WARN_ON_ONCE(!ctx.aux->exception_boundary);
 	WARN_ON_ONCE(!ctx.bp);
 	WARN_ON_ONCE(!ctx.cnt);
-	/* Prevent KASAN false positives for CONFIG_KASAN_STACK by unpoisoning
+	/*
+	 * Prevent KASAN false positives for CONFIG_KASAN_STACK by unpoisoning
 	 * deeper stack depths than ctx.sp as we do not return from bpf_throw,
-	 * which skips compiler generated instrumentation to do the same.
+	 * which skips compiler generated instrumentation to do the same. Some
+	 * architectures cannot recover sp while unwinding, so fall back to bp.
 	 */
 	kasan_unpoison_task_stack_below((void *)(long)ctx.sp);
+	kasan_unpoison_task_stack_below((void *)(long)(ctx.sp ?: ctx.bp));
 	ctx.aux->bpf_exception_cb(cookie, ctx.sp, ctx.bp, 0, 0);
 	WARN(1, "A call to BPF exception callback should never return\n");
 }
@@ -4139,7 +4166,7 @@ struct bpf_task_work_ctx {
 	struct bpf_map *map;
 	void *map_val;
 	enum task_work_notify_mode mode;
-	bpf_task_work_callback_t callback_fn;
+	bpf_callback_t callback_fn;
 	struct rcu_head rcu;
 } __aligned(8);
 
@@ -4214,7 +4241,8 @@ static void bpf_task_work_callback(struct callback_head *cb)
 	key = (void *)map_key_from_value(ctx->map, ctx->map_val, &idx);
 
 	migrate_disable();
-	ctx->callback_fn(ctx->map, key, ctx->map_val);
+	ctx->callback_fn((u64)(long)ctx->map, (u64)(long)key,
+			 (u64)(long)ctx->map_val, 0, 0);
 	migrate_enable();
 
 	bpf_task_work_ctx_reset(ctx);
@@ -4327,7 +4355,7 @@ static struct bpf_task_work_ctx *bpf_task_work_acquire_ctx(struct bpf_task_work 
 }
 
 static int bpf_task_work_schedule(struct task_struct *task, struct bpf_task_work *tw,
-				  struct bpf_map *map, bpf_task_work_callback_t callback_fn,
+				  struct bpf_map *map, void *callback_fn,
 				  struct bpf_prog_aux *aux, enum task_work_notify_mode mode)
 {
 	struct bpf_prog *prog;
@@ -4352,7 +4380,7 @@ static int bpf_task_work_schedule(struct task_struct *task, struct bpf_task_work
 	}
 
 	ctx->task = task;
-	ctx->callback_fn = callback_fn;
+	ctx->callback_fn = (bpf_callback_t)callback_fn;
 	ctx->prog = prog;
 	ctx->mode = mode;
 	ctx->map = map;

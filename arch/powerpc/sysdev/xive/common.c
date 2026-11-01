@@ -74,6 +74,8 @@ static struct xive_ipi_desc {
  */
 static unsigned int xive_ipi_cpu_to_irq(unsigned int cpu)
 {
+	if (!xive_ipis)
+		return XIVE_BAD_IRQ;
 	return xive_ipis[early_cpu_to_node(cpu)].irq;
 }
 #endif
@@ -1038,13 +1040,19 @@ static struct xive_irq_data *xive_irq_alloc_data(unsigned int virq, irq_hw_numbe
 	return xd;
 }
 
-static void xive_irq_free_data(unsigned int virq)
+static void xive_irq_free_data(struct irq_domain *domain, unsigned int virq)
 {
-	struct xive_irq_data *xd = irq_get_chip_data(virq);
+	struct xive_irq_data *xd;
+	struct irq_data *data = irq_domain_get_irq_data(domain, virq);
 
+	if (!data)
+		return;
+
+	xd = irq_data_get_irq_chip_data(data);
 	if (!xd)
 		return;
-	irq_set_chip_data(virq, NULL);
+
+	irq_domain_reset_irq_data(data);
 	xive_cleanup_irq_data(xd);
 	kfree(xd);
 }
@@ -1144,8 +1152,7 @@ static int __init xive_init_ipis(void)
 	if (!ipi_domain)
 		goto out_free_fwnode;
 
-	xive_ipis = kzalloc_objs(*xive_ipis, nr_node_ids,
-				 GFP_KERNEL | __GFP_NOFAIL);
+	xive_ipis = kzalloc_objs(*xive_ipis, nr_node_ids, GFP_KERNEL);
 	if (!xive_ipis)
 		goto out_free_domain;
 
@@ -1170,6 +1177,7 @@ static int __init xive_init_ipis(void)
 
 out_free_xive_ipis:
 	kfree(xive_ipis);
+	xive_ipis = NULL;
 out_free_domain:
 	irq_domain_remove(ipi_domain);
 out_free_fwnode:
@@ -1201,6 +1209,9 @@ static int xive_setup_cpu_ipi(unsigned int cpu)
 	int rc;
 
 	pr_debug("Setting up IPI for CPU %d\n", cpu);
+
+	if (xive_ipi_irq == XIVE_BAD_IRQ)
+		return -EIO;
 
 	xc = per_cpu(xive_cpu, cpu);
 
@@ -1246,6 +1257,9 @@ noinstr static void xive_cleanup_cpu_ipi(unsigned int cpu, struct xive_cpu *xc)
 
 	/* Disable the IPI and free the IRQ data */
 
+	if (xive_ipi_irq == XIVE_BAD_IRQ)
+		return;
+
 	/* Already cleaned up ? */
 	if (xc->hw_ipi == XIVE_BAD_IRQ)
 		return;
@@ -1269,15 +1283,19 @@ noinstr static void xive_cleanup_cpu_ipi(unsigned int cpu, struct xive_cpu *xc)
 	xive_ops->put_ipi(cpu, xc);
 }
 
-void __init xive_smp_probe(void)
+int __init xive_smp_probe(void)
 {
+	int ret;
+
 	smp_ops->cause_ipi = xive_cause_ipi;
 
 	/* Register the IPI */
-	xive_init_ipis();
+	ret = xive_init_ipis();
+	if (ret < 0)
+		return ret;
 
 	/* Allocate and setup IPI for the boot CPU */
-	xive_setup_cpu_ipi(smp_processor_id());
+	return xive_setup_cpu_ipi(smp_processor_id());
 }
 
 #endif /* CONFIG_SMP */
@@ -1305,7 +1323,7 @@ static int xive_irq_domain_map(struct irq_domain *h, unsigned int virq,
 
 static void xive_irq_domain_unmap(struct irq_domain *d, unsigned int virq)
 {
-	xive_irq_free_data(virq);
+	xive_irq_free_data(d, virq);
 }
 
 static int xive_irq_domain_xlate(struct irq_domain *h, struct device_node *ct,
@@ -1443,7 +1461,7 @@ static void xive_irq_domain_free(struct irq_domain *domain,
 	pr_debug("%s %d #%d\n", __func__, virq, nr_irqs);
 
 	for (i = 0; i < nr_irqs; i++)
-		xive_irq_free_data(virq + i);
+		xive_irq_free_data(domain, virq + i);
 }
 #endif
 

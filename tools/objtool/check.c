@@ -15,10 +15,10 @@
 #include <objtool/arch.h>
 #include <objtool/disas.h>
 #include <objtool/check.h>
+#include <objtool/klp.h>
 #include <objtool/special.h>
 #include <objtool/trace.h>
 #include <objtool/warn.h>
-#include <objtool/checksum.h>
 #include <objtool/util.h>
 
 #include <linux/objtool_types.h>
@@ -64,8 +64,8 @@ struct instruction *next_insn_same_sec(struct objtool_file *file,
 	return insn;
 }
 
-static struct instruction *next_insn_same_func(struct objtool_file *file,
-					       struct instruction *insn)
+struct instruction *next_insn_same_func(struct objtool_file *file,
+				       struct instruction *insn)
 {
 	struct instruction *next = next_insn_same_sec(file, insn);
 	struct symbol *func = insn_func(insn);
@@ -113,10 +113,6 @@ static struct instruction *prev_insn_same_sym(struct objtool_file *file,
 		for_each_sec(file->elf, __sec)				\
 			sec_for_each_insn(file, __sec, insn)
 
-#define func_for_each_insn(file, func, insn)				\
-	for (insn = find_insn(file, func->sec, func->offset);		\
-	     insn;							\
-	     insn = next_insn_same_func(file, insn))
 
 #define sym_for_each_insn(file, sym, insn)				\
 	for (insn = find_insn(file, sym->sec, sym->offset);		\
@@ -199,6 +195,8 @@ static bool is_rust_noreturn(const struct symbol *func)
 	 */
 	return str_ends_with(func->name, "_4core3num20from_str_radix_panic")				||
 	       str_ends_with(func->name, "_4core3num22from_ascii_radix_panic")				||
+	       str_ends_with(func->name, "_4core3num28from_ascii_bytes_radix_panic")			||
+	       str_ends_with(func->name, "_4core3str16slice_error_fail")				||
 	       str_ends_with(func->name, "_4core5sliceSp15copy_from_slice17len_mismatch_fail")		||
 	       str_ends_with(func->name, "_4core6option13expect_failed")				||
 	       str_ends_with(func->name, "_4core6option13unwrap_failed")				||
@@ -211,6 +209,7 @@ static bool is_rust_noreturn(const struct symbol *func)
 	       str_ends_with(func->name, "_4core9panicking18panic_nounwind_fmt")			||
 	       str_ends_with(func->name, "_4core9panicking19assert_failed_inner")			||
 	       str_ends_with(func->name, "_4core9panicking30panic_null_pointer_dereference")		||
+	       str_ends_with(func->name, "_4core9panicking32panic_null_reference_constructed")		||
 	       str_ends_with(func->name, "_4core9panicking36panic_misaligned_pointer_dereference")	||
 	       str_ends_with(func->name, "_7___rustc17rust_begin_unwind")				||
 	       strstr(func->name, "_4core9panicking13assert_failed")					||
@@ -887,6 +886,31 @@ static int create_ibt_endbr_seal_sections(struct objtool_file *file)
 	return 0;
 }
 
+/*
+* Grow __cfi_ symbols to fill the NOP gap between the 'mov <hash>, %rax' and
+* the start of the function.
+*/
+static int grow_cfi_symbols(struct objtool_file *file)
+{
+	struct symbol *sym;
+
+	for_each_sym(file->elf, sym) {
+		if (!is_func_sym(sym) || !strstarts(sym->name, "__cfi_") ||
+		    sym->len != 5)
+			continue;
+
+		if (!find_func_by_offset(sym->sec, sym->offset + sym->len + opts.prefix))
+			continue;
+
+		sym->len += opts.prefix;
+		sym->sym.st_size = sym->len;
+		if (elf_write_symbol(file->elf, sym))
+			return -1;
+	}
+
+	return 0;
+}
+
 static int create_cfi_sections(struct objtool_file *file)
 {
 	struct section *sec;
@@ -1022,59 +1046,6 @@ static int create_direct_call_sections(struct objtool_file *file)
 
 	return 0;
 }
-
-#ifdef BUILD_KLP
-static int create_sym_checksum_section(struct objtool_file *file)
-{
-	struct section *sec;
-	struct symbol *sym;
-	unsigned int idx = 0;
-	struct sym_checksum *checksum;
-	size_t entsize = sizeof(struct sym_checksum);
-
-	sec = find_section_by_name(file->elf, ".discard.sym_checksum");
-	if (sec) {
-		if (!opts.dryrun)
-			WARN("file already has .discard.sym_checksum section, skipping");
-
-		return 0;
-	}
-
-	for_each_sym(file->elf, sym)
-		if (sym->csum.checksum)
-			idx++;
-
-	if (!idx)
-		return 0;
-
-	sec = elf_create_section_pair(file->elf, ".discard.sym_checksum", entsize,
-				      idx, idx);
-	if (!sec)
-		return -1;
-
-	idx = 0;
-	for_each_sym(file->elf, sym) {
-		if (!sym->csum.checksum)
-			continue;
-
-		if (!elf_init_reloc(file->elf, sec->rsec, idx, idx * entsize,
-				    sym, 0, R_TEXT64))
-			return -1;
-
-		checksum = (struct sym_checksum *)sec->data->d_buf + idx;
-		checksum->addr = 0; /* reloc */
-		checksum->checksum = sym->csum.checksum;
-
-		mark_sec_changed(file->elf, sec, true);
-
-		idx++;
-	}
-
-	return 0;
-}
-#else
-static int create_sym_checksum_section(struct objtool_file *file) { return -EINVAL; }
-#endif
 
 /*
  * Warnings shouldn't be reported for ignored functions.
@@ -1301,7 +1272,7 @@ static const char *uaccess_safe_builtin[] = {
 	"copy_mc_enhanced_fast_string",
 	"rep_stos_alternative",
 	"rep_movs_alternative",
-	"__copy_user_nocache",
+	"copy_to_nontemporal",
 	NULL
 };
 
@@ -1353,10 +1324,7 @@ static struct reloc *insn_reloc(struct objtool_file *file, struct instruction *i
 {
 	struct reloc *reloc;
 
-	if (insn->no_reloc)
-		return NULL;
-
-	if (!file)
+	if (!file || insn->no_reloc || insn->fake)
 		return NULL;
 
 	reloc = find_reloc_by_dest_range(file->elf, insn->sec,
@@ -2630,9 +2598,17 @@ static void mark_holes(struct objtool_file *file)
 
 static bool validate_branch_enabled(void)
 {
-	return opts.stackval ||
-	       opts.orc ||
-	       opts.uaccess ||
+	return opts.stackval	||
+	       opts.orc		||
+	       opts.uaccess;
+}
+
+static bool alts_needed(void)
+{
+	return validate_branch_enabled()	||
+	       opts.noinstr			||
+	       opts.hack_jump_label		||
+	       opts.disas			||
 	       opts.checksum;
 }
 
@@ -2666,7 +2642,7 @@ static int decode_sections(struct objtool_file *file)
 	 * Must be before add_jump_destinations(), which depends on 'func'
 	 * being set for alternatives, to enable proper sibling call detection.
 	 */
-	if (validate_branch_enabled() || opts.noinstr || opts.hack_jump_label || opts.disas) {
+	if (alts_needed()) {
 		if (add_special_section_alts(file))
 			return -1;
 	}
@@ -3662,88 +3638,6 @@ static bool skip_alt_group(struct instruction *insn)
 	return alt_insn->type == INSN_CLAC || alt_insn->type == INSN_STAC;
 }
 
-static int checksum_debug_init(struct objtool_file *file)
-{
-	char *dup, *s;
-
-	if (!opts.debug_checksum)
-		return 0;
-
-	dup = strdup(opts.debug_checksum);
-	if (!dup) {
-		ERROR_GLIBC("strdup");
-		return -1;
-	}
-
-	s = dup;
-	while (*s) {
-		struct symbol *func;
-		char *comma;
-
-		comma = strchr(s, ',');
-		if (comma)
-			*comma = '\0';
-
-		func = find_symbol_by_name(file->elf, s);
-		if (!func || !is_func_sym(func))
-			WARN("--debug-checksum: can't find '%s'", s);
-		else
-			func->debug_checksum = 1;
-
-		if (!comma)
-			break;
-
-		s = comma + 1;
-	}
-
-	free(dup);
-	return 0;
-}
-
-static void checksum_update_insn(struct objtool_file *file, struct symbol *func,
-				 struct instruction *insn)
-{
-	struct reloc *reloc = insn_reloc(file, insn);
-	unsigned long offset;
-	struct symbol *sym;
-
-	if (insn->fake)
-		return;
-
-	checksum_update(func, insn, insn->sec->data->d_buf + insn->offset, insn->len);
-
-	if (!reloc) {
-		struct symbol *call_dest = insn_call_dest(insn);
-
-		if (call_dest)
-			checksum_update(func, insn, call_dest->demangled_name,
-					strlen(call_dest->demangled_name));
-		return;
-	}
-
-	sym = reloc->sym;
-	offset = arch_insn_adjusted_addend(insn, reloc);
-
-	if (is_string_sec(sym->sec)) {
-		char *str;
-
-		str = sym->sec->data->d_buf + sym->offset + offset;
-		checksum_update(func, insn, str, strlen(str));
-		return;
-	}
-
-	if (is_sec_sym(sym)) {
-		sym = find_symbol_containing(reloc->sym->sec, offset);
-		if (!sym)
-			return;
-
-		offset -= sym->offset;
-	}
-
-	checksum_update(func, insn, sym->demangled_name, strlen(sym->demangled_name));
-	checksum_update(func, insn, &offset, sizeof(offset));
-}
-
 static int validate_branch(struct objtool_file *file, struct symbol *func,
 			   struct instruction *insn, struct insn_state state);
 static int do_validate_branch(struct objtool_file *file, struct symbol *func,
@@ -4025,9 +3919,6 @@ static int do_validate_branch(struct objtool_file *file, struct symbol *func,
 		insn->trace = 0;
 		next_insn = next_insn_to_validate(file, insn);
 
-		if (opts.checksum && func && insn->sec)
-			checksum_update_insn(file, func, insn);
-
 		if (func && insn_func(insn) && func != insn_func(insn)->pfunc) {
 			/* Ignore KCFI type preambles, which always fall through */
 			if (is_prefix_func(func))
@@ -4092,9 +3983,6 @@ static int validate_unwind_hint(struct objtool_file *file,
 	if (insn->hint && !insn->visited) {
 		struct symbol *func = insn_func(insn);
 		int ret;
-
-		if (opts.checksum)
-			checksum_init(func);
 
 		ret = validate_branch(file, func, insn, *state);
 		if (ret)
@@ -4541,9 +4429,6 @@ static int validate_symbol(struct objtool_file *file, struct section *sec,
 
 	func = insn_func(insn);
 
-	if (opts.checksum)
-		checksum_init(func);
-
 	if (opts.trace && !fnmatch(opts.trace, sym->name, 0)) {
 		trace_enable();
 		TRACE("%s: validation begin\n", sym->name);
@@ -4555,9 +4440,6 @@ static int validate_symbol(struct objtool_file *file, struct section *sec,
 
 	TRACE("%s: validation %s\n\n", sym->name, ret ? "failed" : "end");
 	trace_disable();
-
-	if (opts.checksum)
-		checksum_finish(func);
 
 	return ret;
 }
@@ -5015,10 +4897,6 @@ int check(struct objtool_file *file)
 	cfi_hash_add(&init_cfi);
 	cfi_hash_add(&func_cfi);
 
-	ret = checksum_debug_init(file);
-	if (ret)
-		goto out;
-
 	ret = decode_sections(file);
 	if (ret)
 		goto out;
@@ -5069,12 +4947,6 @@ int check(struct objtool_file *file)
 			goto out;
 	}
 
-	if (opts.cfi) {
-		ret = create_cfi_sections(file);
-		if (ret)
-			goto out;
-	}
-
 	if (opts.rethunk) {
 		ret = create_return_sites_sections(file);
 		if (ret)
@@ -5094,9 +4966,21 @@ int check(struct objtool_file *file)
 	}
 
 	if (opts.prefix) {
-		ret = create_prefix_symbols(file);
-		if (ret)
-			goto out;
+		if (!opts.cfi) {
+			ret = create_prefix_symbols(file);
+			if (ret)
+				goto out;
+		} else {
+			ret = grow_cfi_symbols(file);
+			if (ret)
+				goto out;
+
+			if (opts.fineibt) {
+				ret = create_cfi_sections(file);
+				if (ret)
+					goto out;
+			}
+		}
 	}
 
 	if (opts.ibt) {
@@ -5105,14 +4989,14 @@ int check(struct objtool_file *file)
 			goto out;
 	}
 
-	if (opts.noabs)
-		warnings += check_abs_references(file);
-
-	if (opts.checksum) {
-		ret = create_sym_checksum_section(file);
+	if (opts.klp_symids) {
+		ret = klp_create_symid_sections(file);
 		if (ret)
 			goto out;
 	}
+
+	if (opts.noabs)
+		warnings += check_abs_references(file);
 
 	if (opts.orc && nr_insns) {
 		ret = orc_create(file);

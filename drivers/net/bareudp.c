@@ -268,7 +268,7 @@ static int bareudp_socket_create(struct bareudp_dev *bareudp, __be16 port)
 	tunnel_cfg.encap_rcv = bareudp_udp_encap_recv;
 	tunnel_cfg.encap_err_lookup = bareudp_err_lookup;
 	tunnel_cfg.encap_destroy = NULL;
-	setup_udp_tunnel_sock(bareudp->net, sock, &tunnel_cfg);
+	setup_udp_tunnel_sock(bareudp->net, sock->sk, &tunnel_cfg);
 
 	rcu_assign_pointer(bareudp->sock, sock);
 	return 0;
@@ -358,7 +358,7 @@ static int bareudp_xmit_skb(struct sk_buff *skb, struct net_device *dev,
 	if (err)
 		goto free_dst;
 
-	skb_set_inner_protocol(skb, bareudp->ethertype);
+	skb_set_inner_protocol(skb, skb->protocol);
 	udp_tunnel_xmit_skb(rt, sock->sk, skb, saddr, info->key.u.ipv4.dst,
 			    tos, ttl, df, sport, bareudp->port,
 			    !net_eq(bareudp->net, dev_net(bareudp->dev)),
@@ -426,6 +426,7 @@ static int bareudp6_xmit_skb(struct sk_buff *skb, struct net_device *dev,
 	if (err)
 		goto free_dst;
 
+	skb_set_inner_protocol(skb, skb->protocol);
 	daddr = info->key.u.ipv6.dst;
 	udp_tunnel6_xmit_skb(dst, sock->sk, skb, dev,
 			     &saddr, &daddr, prio, ttl,
@@ -528,6 +529,9 @@ static int bareudp_fill_metadata_dst(struct net_device *dev,
 		struct dst_entry *dst;
 		struct in6_addr saddr;
 		struct socket *sock = rcu_dereference(bareudp->sock);
+
+		if (!sock)
+			return -ESHUTDOWN;
 
 		dst = udp_tunnel6_dst_lookup(skb, dev, bareudp->net, sock,
 					     0, &saddr, &info->key,

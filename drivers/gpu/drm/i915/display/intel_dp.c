@@ -508,9 +508,14 @@ bool intel_dp_has_joiner(struct intel_dp *intel_dp)
 	struct intel_display *display = to_intel_display(intel_dp);
 	struct intel_digital_port *intel_dig_port = dp_to_dig_port(intel_dp);
 	struct intel_encoder *encoder = &intel_dig_port->base;
+	struct intel_connector *connector = intel_dp->attached_connector;
 
 	/* eDP MSO is not compatible with joiner */
 	if (intel_dp->mso_link_count)
+		return false;
+
+	if (intel_dp_is_edp(intel_dp) &&
+	    !connector->panel.vbt.edp.pipe_joiner_enable)
 		return false;
 
 	return DISPLAY_VER(display) >= 12 ||
@@ -2981,8 +2986,13 @@ static void intel_dp_compute_vsc_colorimetry(const struct intel_crtc_state *crtc
 	drm_WARN_ON(display->drm,
 		    vsc->bpc == 6 && vsc->pixelformat != DP_PIXELFORMAT_RGB);
 
-	/* all YCbCr are always limited range */
-	vsc->dynamic_range = DP_DYNAMIC_RANGE_CTA;
+	/* All YCbCr formats are always limited range. */
+	if (vsc->pixelformat == DP_PIXELFORMAT_RGB)
+		vsc->dynamic_range = crtc_state->limited_color_range ?
+			DP_DYNAMIC_RANGE_CTA : DP_DYNAMIC_RANGE_VESA;
+	else
+		vsc->dynamic_range = DP_DYNAMIC_RANGE_CTA;
+
 	vsc->content_type = DP_CONTENT_TYPE_NOT_DEFINED;
 }
 
@@ -3237,12 +3247,22 @@ intel_dp_audio_compute_config(struct intel_encoder *encoder,
 			      struct intel_crtc_state *pipe_config,
 			      struct drm_connector_state *conn_state)
 {
+	struct intel_dp *intel_dp = enc_to_intel_dp(encoder);
+
 	pipe_config->has_audio =
 		intel_dp_has_audio(encoder, conn_state) &&
 		intel_audio_compute_config(encoder, pipe_config, conn_state);
 
 	pipe_config->sdp_split_enable = pipe_config->has_audio &&
 					intel_dp_is_uhbr(pipe_config);
+
+	/*
+	 * SDP splitting for UHBR audio requires explicit sink capability in
+	 * SST mode, whereas in MST mode it is inherently supported.
+	 */
+	if (pipe_config->sdp_split_enable &&
+	    !intel_crtc_has_type(pipe_config, INTEL_OUTPUT_DP_MST))
+		pipe_config->sdp_split_enable = intel_dp->sst_split_sdp_support;
 }
 
 void
@@ -3966,7 +3986,14 @@ static int intel_dp_hdmi_sink_max_frl(struct intel_dp *intel_dp)
 	rate_per_lane = info->hdmi.max_frl_rate_per_lane;
 	max_frl_rate = max_lanes * rate_per_lane;
 
-	if (info->hdmi.dsc_cap.v_1p2) {
+	/*
+	 * The sink's DSC max FRL rate only applies to compressed video
+	 * transport, which requires a DSC 1.2 encoder in the PCON. Without
+	 * one the HDMI link always carries uncompressed video, for which
+	 * the regular max FRL rate is the limit.
+	 */
+	if (drm_dp_pcon_enc_is_dsc_1_2(intel_dp->pcon_dsc_dpcd) &&
+	    info->hdmi.dsc_cap.v_1p2) {
 		max_dsc_lanes = info->hdmi.dsc_cap.max_lanes;
 		dsc_rate_per_lane = info->hdmi.dsc_cap.max_frl_rate_per_lane;
 		if (max_dsc_lanes && dsc_rate_per_lane)
@@ -4283,14 +4310,23 @@ void intel_dp_configure_protocol_converter(struct intel_dp *intel_dp,
 			    str_enable_disable(tmp));
 }
 
-static bool intel_dp_get_colorimetry_status(struct intel_dp *intel_dp)
+static u8 intel_dp_read_dprx_feature_enum(struct intel_dp *intel_dp)
 {
 	u8 dprx = 0;
 
-	if (drm_dp_dpcd_readb(&intel_dp->aux, DP_DPRX_FEATURE_ENUMERATION_LIST,
-			      &dprx) != 1)
-		return false;
+	drm_dp_dpcd_read_data(&intel_dp->aux, DP_DPRX_FEATURE_ENUMERATION_LIST,
+			      &dprx, sizeof(dprx));
+	return dprx;
+}
+
+static bool intel_dp_get_colorimetry_status(u8 dprx)
+{
 	return dprx & DP_VSC_SDP_EXT_FOR_COLORIMETRY_SUPPORTED;
+}
+
+static bool intel_dp_get_sst_split_sdp_status(u8 dprx)
+{
+	return dprx & DP_SST_SPLIT_SDP_CAP;
 }
 
 static void intel_dp_read_dsc_dpcd(struct drm_dp_aux *aux,
@@ -4528,10 +4564,17 @@ intel_edp_set_sink_rates(struct intel_dp *intel_dp)
 
 	if (intel_dp->edp_dpcd[0] >= DP_EDP_14) {
 		__le16 sink_rates[DP_MAX_SUPPORTED_RATES];
+		int ret;
 		int i;
 
-		drm_dp_dpcd_read(&intel_dp->aux, DP_SUPPORTED_LINK_RATES,
-				 sink_rates, sizeof(sink_rates));
+		ret = drm_dp_dpcd_read_data(&intel_dp->aux,
+					    DP_SUPPORTED_LINK_RATES,
+					    sink_rates, sizeof(sink_rates));
+		if (ret < 0) {
+			drm_dbg_kms(display->drm,
+				    "Unable to read eDP supported link rates, using default rates\n");
+			memset(sink_rates, 0, sizeof(sink_rates));
+		}
 
 		for (i = 0; i < ARRAY_SIZE(sink_rates); i++) {
 			int rate;
@@ -4578,6 +4621,7 @@ intel_edp_init_dpcd(struct intel_dp *intel_dp, struct intel_connector *connector
 {
 	struct intel_display *display = to_intel_display(intel_dp);
 	int ret;
+	u8 dprx;
 
 	/* this function is meant to be called only once */
 	drm_WARN_ON(display->drm, intel_dp->dpcd[DP_DPCD_REV] != 0);
@@ -4589,8 +4633,13 @@ intel_edp_init_dpcd(struct intel_dp *intel_dp, struct intel_connector *connector
 			 drm_dp_is_branch(intel_dp->dpcd));
 	intel_init_dpcd_quirks(intel_dp, &intel_dp->desc.ident);
 
+	dprx = intel_dp_read_dprx_feature_enum(intel_dp);
+
 	intel_dp->colorimetry_support =
-		intel_dp_get_colorimetry_status(intel_dp);
+		intel_dp_get_colorimetry_status(dprx);
+
+	intel_dp->sst_split_sdp_support =
+		intel_dp_get_sst_split_sdp_status(dprx);
 
 	/*
 	 * Read the eDP display control registers.
@@ -4669,13 +4718,20 @@ intel_dp_get_dpcd(struct intel_dp *intel_dp)
 	 * the OUI/ID since we know it won't change.
 	 */
 	if (!intel_dp_is_edp(intel_dp)) {
+		u8 dprx;
+
 		drm_dp_read_desc(&intel_dp->aux, &intel_dp->desc,
 				 drm_dp_is_branch(intel_dp->dpcd));
 
 		intel_init_dpcd_quirks(intel_dp, &intel_dp->desc.ident);
 
+		dprx = intel_dp_read_dprx_feature_enum(intel_dp);
+
 		intel_dp->colorimetry_support =
-			intel_dp_get_colorimetry_status(intel_dp);
+			intel_dp_get_colorimetry_status(dprx);
+
+		intel_dp->sst_split_sdp_support =
+			intel_dp_get_sst_split_sdp_status(dprx);
 
 		intel_dp_update_sink_caps(intel_dp);
 	}
@@ -5062,7 +5118,7 @@ int intel_dp_as_sdp_unpack(struct drm_dp_as_sdp *as_sdp,
 	as_sdp->length = sdp->sdp_header.HB3 & DP_ADAPTIVE_SYNC_SDP_LENGTH;
 	as_sdp->mode = sdp->db[0] & DP_ADAPTIVE_SYNC_SDP_OPERATION_MODE;
 	as_sdp->vtotal = (sdp->db[2] << 8) | sdp->db[1];
-	as_sdp->target_rr = (u64)sdp->db[3] | ((u64)sdp->db[4] & 0x3);
+	as_sdp->target_rr = ((sdp->db[4] & 0x3) << 8) | sdp->db[3];
 	as_sdp->target_rr_divider = sdp->db[4] & 0x20 ? true : false;
 
 	return 0;
@@ -5359,8 +5415,9 @@ intel_dp_check_mst_status(struct intel_dp *intel_dp)
 	struct intel_encoder *encoder = &dig_port->base;
 	bool link_ok = true;
 	bool reprobe_needed = false;
+	int tries = 33;
 
-	for (;;) {
+	while (--tries) {
 		u8 esi[4] = {};
 		u8 ack[4] = {};
 
@@ -5402,6 +5459,11 @@ intel_dp_check_mst_status(struct intel_dp *intel_dp)
 
 	if (!link_ok || intel_dp->link.force_retrain)
 		intel_encoder_link_check_queue_work(encoder, 0);
+
+	if (!tries) {
+		drm_dbg_kms(display->drm, "DPRX ESI not clearing, device may be stuck\n");
+		reprobe_needed = true;
+	}
 
 	return !reprobe_needed;
 }

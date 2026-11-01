@@ -380,14 +380,16 @@ void drm_bridge_add(struct drm_bridge *bridge)
 	 * in bridge_lingering_list. Remove it or bridge_lingering_list will be
 	 * corrupted when adding this bridge to bridge_list below.
 	 */
+	mutex_lock(&bridge_lock);
 	if (!list_empty(&bridge->list))
 		list_del_init(&bridge->list);
+	mutex_unlock(&bridge_lock);
 
 	mutex_init(&bridge->hpd_mutex);
 
 	if (bridge->ops & DRM_BRIDGE_OP_HDMI)
 		bridge->ycbcr_420_allowed = !!(bridge->supported_formats &
-					       BIT(HDMI_COLORSPACE_YUV420));
+					       BIT(DRM_OUTPUT_COLOR_FORMAT_YCBCR420));
 
 	mutex_lock(&bridge_lock);
 	list_add_tail(&bridge->list, &bridge_list);
@@ -508,8 +510,10 @@ int drm_bridge_attach(struct drm_encoder *encoder, struct drm_bridge *bridge,
 	if (!bridge->container)
 		DRM_WARN("DRM bridge corrupted or not allocated by devm_drm_bridge_alloc()\n");
 
-	if (list_empty(&bridge->list))
-		DRM_WARN("Missing drm_bridge_add() before attach\n");
+	scoped_guard(mutex, &bridge_lock) {
+		if (list_empty(&bridge->list))
+			DRM_WARN("Missing drm_bridge_add() before attach\n");
+	}
 
 	drm_bridge_get(bridge);
 

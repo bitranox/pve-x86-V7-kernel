@@ -313,7 +313,7 @@ static int write_tracing_data(struct feat_fd *ff,
 	if (WARN(ff->buf, "Error: calling %s in pipe-mode.\n", __func__))
 		return -1;
 
-	return read_tracing_data(ff->fd, &evlist->core.entries);
+	return read_tracing_data(ff->fd, &evlist__core(evlist)->entries);
 }
 #endif
 
@@ -384,7 +384,7 @@ static int write_e_machine(struct feat_fd *ff,
 {
 	/* e_machine expanded from 16 to 32-bits for alignment. */
 	uint32_t e_flags;
-	uint32_t e_machine = perf_session__e_machine(evlist->session, &e_flags);
+	uint32_t e_machine = perf_session__e_machine(evlist__session(evlist), &e_flags);
 	int ret;
 
 	ret = do_write(ff, &e_machine, sizeof(e_machine));
@@ -520,7 +520,7 @@ static int write_event_desc(struct feat_fd *ff,
 	u32 nre, nri, sz;
 	int ret;
 
-	nre = evlist->core.nr_entries;
+	nre = evlist__nr_entries(evlist);
 
 	/*
 	 * write number of events
@@ -902,7 +902,7 @@ int __weak get_cpuid(char *buffer __maybe_unused, size_t sz __maybe_unused,
 
 static int write_cpuid(struct feat_fd *ff, struct evlist *evlist)
 {
-	struct perf_cpu cpu = perf_cpu_map__min(evlist->core.all_cpus);
+	struct perf_cpu cpu = perf_cpu_map__min(evlist__core(evlist)->all_cpus);
 	char buffer[64];
 	int ret;
 
@@ -1035,7 +1035,8 @@ static int write_bpf_prog_info(struct feat_fd *ff,
 	struct rb_node *next;
 	int ret = 0;
 
-	down_read(&env->bpf_progs.lock);
+	/* write lock: bpil_addr_to_offs() temporarily mutates info_linear */
+	down_write(&env->bpf_progs.lock);
 
 	ret = do_write(ff, &env->bpf_progs.infos_cnt,
 		       sizeof(env->bpf_progs.infos_cnt));
@@ -1065,7 +1066,7 @@ static int write_bpf_prog_info(struct feat_fd *ff,
 			goto out;
 	}
 out:
-	up_read(&env->bpf_progs.lock);
+	up_write(&env->bpf_progs.lock);
 	return ret;
 }
 
@@ -1314,14 +1315,14 @@ static int write_sample_time(struct feat_fd *ff,
 			     struct evlist *evlist)
 {
 	int ret;
+	u64 data = evlist__first_sample_time(evlist);
 
-	ret = do_write(ff, &evlist->first_sample_time,
-		       sizeof(evlist->first_sample_time));
+	ret = do_write(ff, &data, sizeof(data));
 	if (ret < 0)
 		return ret;
 
-	return do_write(ff, &evlist->last_sample_time,
-			sizeof(evlist->last_sample_time));
+	data = evlist__last_sample_time(evlist);
+	return do_write(ff, &data, sizeof(data));
 }
 
 
@@ -2001,8 +2002,7 @@ static void print_bpf_prog_info(struct feat_fd *ff, FILE *fp)
 		node = rb_entry(next, struct bpf_prog_info_node, rb_node);
 		next = rb_next(&node->rb_node);
 
-		__bpf_event__print_bpf_prog_info(&node->info_linear->info,
-						 env, fp);
+		__bpf_event__print_bpf_prog_info(node->info_linear, env, fp);
 	}
 
 	up_read(&env->bpf_progs.lock);
@@ -2095,8 +2095,27 @@ static struct evsel *read_event_desc(struct feat_fd *ff)
 	if (do_read_u32(ff, &nre))
 		goto error;
 
+	/* Size of each of the nre attributes. */
 	if (do_read_u32(ff, &sz))
 		goto error;
+
+	/*
+	 * Require at least one event with an attr no smaller than the
+	 * first published struct, and reject sz values where
+	 * sz + sizeof(u32) would overflow size_t (possible on 32-bit)
+	 * or nre == UINT32_MAX where nre + 1 wraps to 0 in the calloc.
+	 *
+	 * The minimum section footprint per event is sz bytes for the
+	 * attr plus a u32 for the id count, check that nre events fit.
+	 */
+	if (!nre || sz < PERF_ATTR_SIZE_VER0 ||
+	    sz > ff->size || (size_t)sz > SIZE_MAX - sizeof(u32) ||
+	    nre == UINT32_MAX ||
+	    nre > (ff->size - ff->offset) / (sz + sizeof(u32))) {
+		pr_err("Invalid HEADER_EVENT_DESC: nre=%u sz=%u (min %d)\n",
+		       nre, sz, PERF_ATTR_SIZE_VER0);
+		goto error;
+	}
 
 	/* buffer to hold on file attr struct */
 	buf = malloc(sz);
@@ -2113,6 +2132,9 @@ static struct evsel *read_event_desc(struct feat_fd *ff)
 		msz = sz;
 
 	for (i = 0, evsel = events; i < nre; evsel++, i++) {
+		struct perf_event_attr *attr = buf;
+		u32 attr_size;
+
 		evsel->core.idx = i;
 
 		/*
@@ -2121,6 +2143,32 @@ static struct evsel *read_event_desc(struct feat_fd *ff)
 		 */
 		if (__do_read(ff, buf, sz))
 			goto error;
+
+		/* Reject before attr_swap to prevent OOB via bswap_safe() */
+		attr_size = ff->ph->needs_swap ? bswap_32(attr->size) : attr->size;
+		/* ABI0: size == 0 means the producer didn't set it */
+		if (!attr_size) {
+			attr_size = PERF_ATTR_SIZE_VER0;
+			/*
+			 * Write back so free_event_desc() doesn't
+			 * treat this event as the end-of-array sentinel
+			 * (it iterates while attr.size != 0).
+			 *
+			 * Only for native — the swap path must NOT
+			 * write native-endian VER0 here because
+			 * perf_event__attr_swap() would re-swap it
+			 * to 0x40000000, defeating bswap_safe() bounds.
+			 * perf_event__attr_swap() has its own ABI0
+			 * fallback that sets VER0 after swapping.
+			 */
+			if (!ff->ph->needs_swap)
+				attr->size = attr_size;
+		}
+		if (attr_size < PERF_ATTR_SIZE_VER0 || attr_size > sz) {
+			pr_err("Event %d attr.size (%u) invalid (min: %d, max: %u)\n",
+			       i, attr_size, PERF_ATTR_SIZE_VER0, sz);
+			goto error;
+		}
 
 		if (ff->ph->needs_swap)
 			perf_event__attr_swap(buf);
@@ -2142,6 +2190,12 @@ static struct evsel *read_event_desc(struct feat_fd *ff)
 
 		if (!nr)
 			continue;
+
+		/* Prevent oversized allocation from crafted nr */
+		if (nr > (ff->size - ff->offset) / sizeof(*id)) {
+			pr_err("Event %d: id count %u exceeds remaining section\n", i, nr);
+			goto error;
+		}
 
 		id = calloc(nr, sizeof(*id));
 		if (!id)
@@ -2380,16 +2434,16 @@ static void print_sample_time(struct feat_fd *ff, FILE *fp)
 
 	session = container_of(ff->ph, struct perf_session, header);
 
-	timestamp__scnprintf_usec(session->evlist->first_sample_time,
+	timestamp__scnprintf_usec(evlist__first_sample_time(session->evlist),
 				  time_buf, sizeof(time_buf));
 	fprintf(fp, "# time of first sample : %s\n", time_buf);
 
-	timestamp__scnprintf_usec(session->evlist->last_sample_time,
+	timestamp__scnprintf_usec(evlist__last_sample_time(session->evlist),
 				  time_buf, sizeof(time_buf));
 	fprintf(fp, "# time of last sample : %s\n", time_buf);
 
-	d = (double)(session->evlist->last_sample_time -
-		session->evlist->first_sample_time) / NSEC_PER_MSEC;
+	d = (double)(evlist__last_sample_time(session->evlist) -
+		evlist__first_sample_time(session->evlist)) / NSEC_PER_MSEC;
 
 	fprintf(fp, "# sample duration : %10.3f ms\n", d);
 }
@@ -3170,8 +3224,8 @@ static int process_sample_time(struct feat_fd *ff, void *data __maybe_unused)
 	if (ret)
 		return -1;
 
-	session->evlist->first_sample_time = first_sample_time;
-	session->evlist->last_sample_time = last_sample_time;
+	evlist__set_first_sample_time(session->evlist, first_sample_time);
+	evlist__set_last_sample_time(session->evlist, last_sample_time);
 	return 0;
 }
 
@@ -3770,6 +3824,13 @@ struct header_print_data {
 	bool full; /* extended list of headers */
 };
 
+const char *header_feat__name(unsigned int id)
+{
+	if (id < HEADER_LAST_FEATURE)
+		return feat_ops[id].name ?: "INVALID";
+	return "INVALID";
+}
+
 static int perf_file_section__fprintf_info(struct perf_file_section *section,
 					   struct perf_header *ph,
 					   int feat, int fd, void *data)
@@ -3778,11 +3839,11 @@ static int perf_file_section__fprintf_info(struct perf_file_section *section,
 	struct feat_fd ff;
 
 	if (lseek(fd, section->offset, SEEK_SET) == (off_t)-1) {
-		pr_debug("Failed to lseek to %" PRIu64 " offset for feature "
-				"%d, continuing...\n", section->offset, feat);
+		pr_debug("Failed to lseek to %" PRIu64 " offset for feature %s (%d), continuing...\n",
+			 section->offset, header_feat__name(feat), feat);
 		return 0;
 	}
-	if (feat >= HEADER_LAST_FEATURE) {
+	if (feat >= ph->last_feat) {
 		pr_warning("unknown feature %d\n", feat);
 		return 0;
 	}
@@ -3834,7 +3895,7 @@ int perf_header__fprintf_info(struct perf_session *session, FILE *fp, bool full)
 		return 0;
 
 	fprintf(fp, "# missing features: ");
-	for_each_clear_bit(bit, header->adds_features, HEADER_LAST_FEATURE) {
+	for_each_clear_bit(bit, header->adds_features, header->last_feat) {
 		if (bit)
 			fprintf(fp, "%s ", feat_ops[bit].name);
 	}
@@ -4100,7 +4161,7 @@ int perf_session__write_header(struct perf_session *session,
 					     /*write_attrs_after_data=*/false);
 }
 
-size_t perf_session__data_offset(const struct evlist *evlist)
+size_t perf_session__data_offset(struct evlist *evlist)
 {
 	struct evsel *evsel;
 	size_t data_offset;
@@ -4109,7 +4170,7 @@ size_t perf_session__data_offset(const struct evlist *evlist)
 	evlist__for_each_entry(evlist, evsel) {
 		data_offset += evsel->core.ids * sizeof(u64);
 	}
-	data_offset += evlist->core.nr_entries * sizeof(struct perf_file_attr);
+	data_offset += evlist__nr_entries(evlist) * sizeof(struct perf_file_attr);
 
 	return data_offset;
 }
@@ -4164,7 +4225,7 @@ int perf_header__process_sections(struct perf_header *header, int fd,
 	if (err < 0)
 		goto out_free;
 
-	for_each_set_bit(feat, header->adds_features, HEADER_LAST_FEATURE) {
+	for_each_set_bit(feat, header->adds_features, header->last_feat) {
 		err = process(sec++, header, feat, fd, data);
 		if (err < 0)
 			goto out_free;
@@ -4379,6 +4440,7 @@ int perf_file_header__read(struct perf_file_header *header,
 	ph->data_offset  = header->data.offset;
 	ph->data_size	 = header->data.size;
 	ph->feat_offset  = header->data.offset + header->data.size;
+	ph->last_feat	 = HEADER_LAST_FEATURE;
 	return 0;
 }
 
@@ -4394,8 +4456,8 @@ static int perf_file_section__process(struct perf_file_section *section,
 	};
 
 	if (lseek(fd, section->offset, SEEK_SET) == (off_t)-1) {
-		pr_debug("Failed to lseek to %" PRIu64 " offset for feature "
-			  "%d, continuing...\n", section->offset, feat);
+		pr_debug("Failed to lseek to %" PRIu64 " offset for feature %s (%d), continuing...\n",
+			 section->offset, header_feat__name(feat), feat);
 		return 0;
 	}
 
@@ -4428,6 +4490,8 @@ static int perf_file_header__read_pipe(struct perf_pipe_file_header *header,
 	if (ph->needs_swap)
 		header->size = bswap_64(header->size);
 
+	/* The last feature is written out as a 0 sized event and will update this value. */
+	ph->last_feat = 0;
 	return 0;
 }
 
@@ -4550,7 +4614,7 @@ int perf_session__read_header(struct perf_session *session)
 	if (session->evlist == NULL)
 		return -ENOMEM;
 
-	session->evlist->session = session;
+	evlist__set_session(session->evlist, session);
 	session->machines.host.env = &header->env;
 
 	/*
@@ -4610,12 +4674,12 @@ int perf_session__read_header(struct perf_session *session)
 		evsel = evsel__new(&f_attr.attr);
 
 		if (evsel == NULL)
-			goto out_delete_evlist;
+			goto out_put_evlist;
 
 		evsel->needs_swap = header->needs_swap;
 		/*
 		 * Do it before so that if perf_evsel__alloc_id fails, this
-		 * entry gets purged too at evlist__delete().
+		 * entry gets purged too at evlist__put().
 		 */
 		evlist__add(session->evlist, evsel);
 
@@ -4626,7 +4690,7 @@ int perf_session__read_header(struct perf_session *session)
 		 * hattr->ids threads.
 		 */
 		if (perf_evsel__alloc_id(&evsel->core, 1, nr_ids))
-			goto out_delete_evlist;
+			goto out_put_evlist;
 
 		lseek(fd, f_attr.ids.offset, SEEK_SET);
 
@@ -4634,7 +4698,8 @@ int perf_session__read_header(struct perf_session *session)
 			if (perf_header__getbuffer64(header, fd, &f_id, sizeof(f_id)))
 				goto out_errno;
 
-			perf_evlist__id_add(&session->evlist->core, &evsel->core, 0, j, f_id);
+			perf_evlist__id_add(evlist__core(session->evlist),
+					    &evsel->core, 0, j, f_id);
 		}
 
 		lseek(fd, tmp, SEEK_SET);
@@ -4645,7 +4710,7 @@ int perf_session__read_header(struct perf_session *session)
 				      perf_file_section__process);
 
 	if (evlist__prepare_tracepoint_events(session->evlist, session->tevent.pevent))
-		goto out_delete_evlist;
+		goto out_put_evlist;
 #else
 	perf_header__process_sections(header, fd, NULL, perf_file_section__process);
 #endif
@@ -4654,37 +4719,74 @@ int perf_session__read_header(struct perf_session *session)
 out_errno:
 	return -errno;
 
-out_delete_evlist:
-	evlist__delete(session->evlist);
+out_put_evlist:
+	evlist__put(session->evlist);
 	session->evlist = NULL;
 	return -ENOMEM;
 }
 
-int perf_event__process_feature(struct perf_session *session,
+int perf_event__process_feature(const struct perf_tool *tool __maybe_unused,
+				struct perf_session *session,
 				union perf_event *event)
 {
 	struct feat_fd ff = { .fd = 0 };
 	struct perf_record_header_feature *fe = (struct perf_record_header_feature *)event;
+	struct perf_header *header = &session->header;
 	int type = fe->header.type;
-	u64 feat = fe->feat_id;
+	int feat = (int)fe->feat_id;
 	int ret = 0;
 	bool print = dump_trace;
+	bool last_feature_mark = false;
 
 	if (type < 0 || type >= PERF_RECORD_HEADER_MAX) {
 		pr_warning("invalid record type %d in pipe-mode\n", type);
 		return 0;
 	}
-	if (feat == HEADER_RESERVED || feat >= HEADER_LAST_FEATURE) {
-		pr_warning("invalid record type %d in pipe-mode\n", type);
+	if (feat == HEADER_RESERVED) {
+		pr_warning("invalid reserved record type in pipe-mode\n");
 		return -1;
 	}
-
+	if (feat < 0 || feat == INT_MAX) {
+		pr_warning("invalid value for feature type %x\n", feat);
+		return -1;
+	}
+	if (feat >= header->last_feat) {
+		if (event->header.size == sizeof(*fe)) {
+			/*
+			 * Either an unexpected zero size feature or the
+			 * HEADER_LAST_FEATURE mark.
+			 */
+			if (feat > header->last_feat)
+				header->last_feat = min(feat, HEADER_LAST_FEATURE);
+			last_feature_mark = true;
+		} else {
+			/*
+			 * A feature but beyond what is known as in
+			 * bounds. Assume the last feature is 1 beyond this
+			 * feature.
+			 */
+			session->header.last_feat = min(feat + 1, HEADER_LAST_FEATURE);
+		}
+	}
+	if (feat >= HEADER_LAST_FEATURE) {
+		if (!last_feature_mark) {
+			pr_warning("unknown feature %d for data file version (%s) in this version of perf (%s)\n",
+				   feat, header->env.version, perf_version_string);
+		}
+		return 0;
+	}
+	if (event->header.size < sizeof(*fe)) {
+		pr_warning("feature header size too small\n");
+		return -1;
+	}
 	ff.buf  = (void *)fe->data;
 	ff.size = event->header.size - sizeof(*fe);
-	ff.ph = &session->header;
+	ff.ph = header;
 
 	if (feat_ops[feat].process && feat_ops[feat].process(&ff, NULL)) {
-		ret = -1;
+		// Processing failed, ignore when this is the last feature mark.
+		if (!last_feature_mark)
+			ret = -1;
 		goto out;
 	}
 
@@ -4790,7 +4892,7 @@ int perf_event__process_attr(const struct perf_tool *tool __maybe_unused,
 
 	ids = perf_record_header_attr_id(event);
 	for (i = 0; i < n_ids; i++) {
-		perf_evlist__id_add(&evlist->core, &evsel->core, 0, i, ids[i]);
+		perf_evlist__id_add(evlist__core(evlist), &evsel->core, 0, i, ids[i]);
 	}
 
 	return 0;

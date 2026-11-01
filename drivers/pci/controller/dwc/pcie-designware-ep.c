@@ -754,7 +754,7 @@ static int dw_pcie_ep_set_msix(struct pci_epc *epc, u8 func_no, u8 vfunc_no,
 	val = dw_pcie_ep_readw_dbi(ep, func_no, reg);
 	val &= ~PCI_MSIX_FLAGS_QSIZE;
 	val |= nr_irqs - 1; /* encoded as N-1 */
-	dw_pcie_writew_dbi(pci, reg, val);
+	dw_pcie_ep_writew_dbi(ep, func_no, reg, val);
 
 	reg = ep_func->msix_cap + PCI_MSIX_TABLE;
 	val = offset | bir;
@@ -914,6 +914,8 @@ int dw_pcie_ep_raise_msi_irq(struct dw_pcie_ep *ep, u8 func_no,
 		 * there is no unified way to check if we have operations in
 		 * flight, thus we don't know if we should WARN() or not.
 		 */
+		/* flush posted write before unmap */
+		readl(ep->msi_mem + ep->msi_iatu_mapped_offset);
 		dw_pcie_ep_unmap_addr(epc, func_no, 0, ep->msi_mem_phys);
 		ep->msi_iatu_mapped = false;
 	}
@@ -926,6 +928,7 @@ int dw_pcie_ep_raise_msi_irq(struct dw_pcie_ep *ep, u8 func_no,
 			return ret;
 
 		ep->msi_iatu_mapped = true;
+		ep->msi_iatu_mapped_offset = offset;
 		ep->msi_msg_addr = msg_addr;
 		ep->msi_map_size = map_size;
 	}
@@ -1006,6 +1009,17 @@ int dw_pcie_ep_raise_msix_irq(struct dw_pcie_ep *ep, u8 func_no,
 		return -EPERM;
 	}
 
+	/*
+	 * ep->msi_iatu_mapped means that an MSI target address is cached,
+	 * unmap it first so that we can reuse ep->msi_mem_phys for MSI-X.
+	 */
+	if (ep->msi_iatu_mapped) {
+		/* flush posted write before unmap */
+		readl(ep->msi_mem + ep->msi_iatu_mapped_offset);
+		dw_pcie_ep_unmap_addr(epc, func_no, 0, ep->msi_mem_phys);
+		ep->msi_iatu_mapped = false;
+	}
+
 	msg_addr = dw_pcie_ep_align_addr(epc, msg_addr, &map_size, &offset);
 	ret = dw_pcie_ep_map_addr(epc, func_no, 0, ep->msi_mem_phys, msg_addr,
 				  map_size);
@@ -1034,6 +1048,11 @@ EXPORT_SYMBOL_GPL(dw_pcie_ep_raise_msix_irq);
 void dw_pcie_ep_cleanup(struct dw_pcie_ep *ep)
 {
 	struct dw_pcie *pci = to_dw_pcie_from_ep(ep);
+
+	if (ep->msi_iatu_mapped) {
+		dw_pcie_ep_unmap_addr(ep->epc, 0, 0, ep->msi_mem_phys);
+		ep->msi_iatu_mapped = false;
+	}
 
 	dwc_pcie_debugfs_deinit(pci);
 	dw_pcie_edma_remove(pci);
@@ -1110,7 +1129,8 @@ static void dw_pcie_ep_init_non_sticky_registers(struct dw_pcie *pci)
 {
 	struct dw_pcie_ep *ep = &pci->ep;
 	u8 funcs = ep->epc->max_functions;
-	u8 func_no;
+	u32 func0_lnkcap, lnkcap;
+	u8 func_no, offset;
 
 	dw_pcie_dbi_ro_wr_en(pci);
 
@@ -1118,6 +1138,32 @@ static void dw_pcie_ep_init_non_sticky_registers(struct dw_pcie *pci)
 		dw_pcie_ep_init_rebar_registers(ep, func_no);
 
 	dw_pcie_setup(pci);
+
+	/*
+	 * PCIe r7.0, section 7.5.3.6 states that for multi-function
+	 * endpoints, max link width and speed fields must report same
+	 * values for all functions. However, dw_pcie_setup() programs
+	 * these fields only for function 0. Hence, mirror these fields
+	 * to all other functions as well.
+	 */
+	if (funcs > 1) {
+		offset = dw_pcie_find_capability(pci, PCI_CAP_ID_EXP);
+		func0_lnkcap = dw_pcie_readl_dbi(pci, offset + PCI_EXP_LNKCAP);
+		func0_lnkcap = FIELD_GET(PCI_EXP_LNKCAP_MLW |
+					 PCI_EXP_LNKCAP_SLS, func0_lnkcap);
+
+		for (func_no = 1; func_no < funcs; func_no++) {
+			offset = dw_pcie_ep_find_capability(ep, func_no,
+							    PCI_CAP_ID_EXP);
+			lnkcap = dw_pcie_ep_readl_dbi(ep, func_no,
+						      offset + PCI_EXP_LNKCAP);
+			FIELD_MODIFY(PCI_EXP_LNKCAP_MLW | PCI_EXP_LNKCAP_SLS,
+				     &lnkcap, func0_lnkcap);
+			dw_pcie_ep_writel_dbi(ep, func_no,
+					      offset + PCI_EXP_LNKCAP, lnkcap);
+		}
+	}
+
 	dw_pcie_dbi_ro_wr_dis(pci);
 }
 
