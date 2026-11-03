@@ -358,7 +358,8 @@ static inline int dname_external(const struct dentry *dentry)
 	return dentry->d_name.name != dentry->d_shortname.string;
 }
 
-void take_dentry_name_snapshot(struct name_snapshot *name, struct dentry *dentry)
+static bool __take_dentry_name_snapshot(struct name_snapshot *name,
+					struct dentry *dentry, bool retry)
 {
 	unsigned seq;
 	const unsigned char *s;
@@ -375,8 +376,12 @@ retry:
 		struct external_name *p;
 		p = container_of(s, struct external_name, name[0]);
 		// get a valid reference
-		if (unlikely(!atomic_inc_not_zero(&p->count)))
-			goto retry;
+		if (unlikely(!atomic_inc_not_zero(&p->count))) {
+			if (retry)
+				goto retry;
+			rcu_read_unlock();
+			return false;
+		}
 		name->name.name = s;
 	}
 	if (read_seqcount_retry(&dentry->d_seq, seq)) {
@@ -384,8 +389,26 @@ retry:
 		goto retry;
 	}
 	rcu_read_unlock();
+	return true;
+}
+
+void take_dentry_name_snapshot(struct name_snapshot *name, struct dentry *dentry)
+{
+	__take_dentry_name_snapshot(name, dentry, true);
 }
 EXPORT_SYMBOL(take_dentry_name_snapshot);
+
+/*
+ * For a caller that holds no reference on @dentry, e.g. in RCU walk.
+ * The external name of a dead dentry has a zero refcount forever, so
+ * take_dentry_name_snapshot() would retry without end.  Fail instead.
+ */
+bool try_take_dentry_name_snapshot(struct name_snapshot *name,
+				   struct dentry *dentry)
+{
+	return __take_dentry_name_snapshot(name, dentry, false);
+}
+EXPORT_SYMBOL(try_take_dentry_name_snapshot);
 
 void release_dentry_name_snapshot(struct name_snapshot *name)
 {
@@ -1465,6 +1488,8 @@ EXPORT_SYMBOL(path_has_submounts);
  *
  * Only one of d_invalidate() and d_set_mounted() must succeed.  For
  * this reason take rename_lock and d_lock on dentry and ancestors.
+ * Likewise for dont_mount() which marks a dentry that is being removed
+ * under d_lock.
  */
 int d_set_mounted(struct dentry *dentry)
 {
@@ -1481,7 +1506,7 @@ int d_set_mounted(struct dentry *dentry)
 		spin_unlock(&p->d_lock);
 	}
 	spin_lock(&dentry->d_lock);
-	if (!d_unlinked(dentry)) {
+	if (!d_unlinked(dentry) && !cant_mount(dentry)) {
 		ret = -EBUSY;
 		if (!d_mountpoint(dentry)) {
 			dentry->d_flags |= DCACHE_MOUNTED;
@@ -3257,7 +3282,7 @@ static void __init dcache_init_early(void)
 					HASH_EARLY | HASH_ZERO,
 					&d_hash_shift,
 					NULL,
-					0,
+					2,
 					0);
 	d_hash_shift = 32 - d_hash_shift;
 
@@ -3289,7 +3314,7 @@ static void __init dcache_init(void)
 					HASH_ZERO,
 					&d_hash_shift,
 					NULL,
-					0,
+					2,
 					0);
 	d_hash_shift = 32 - d_hash_shift;
 

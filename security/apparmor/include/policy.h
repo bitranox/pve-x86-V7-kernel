@@ -208,7 +208,7 @@ struct aa_ruleset {
 
 void aa_free_ruleset(struct aa_ruleset *rules);
 struct aa_ruleset *aa_new_ruleset(gfp_t gfp);
-struct aa_ruleset *aa_clone_ruleset(struct aa_ruleset *rules);
+struct aa_ruleset *aa_clone_ruleset(struct aa_ruleset *rules, gfp_t gfp);
 
 /* struct aa_attachment - data and rules for a profiles attachment
  * @list:
@@ -307,6 +307,9 @@ struct aa_profile *aa_alloc_profile(const char *name, struct aa_proxy *proxy,
 				    gfp_t gfp);
 struct aa_profile *aa_alloc_null(struct aa_profile *parent, const char *name,
 				 gfp_t gfp);
+struct aa_profile *__aa_new_learning_profile(struct aa_profile *parent,
+					     bool hat, const char *base,
+					     gfp_t gfp);
 struct aa_profile *aa_new_learning_profile(struct aa_profile *parent, bool hat,
 					   const char *base, gfp_t gfp);
 void aa_free_profile(struct aa_profile *profile);

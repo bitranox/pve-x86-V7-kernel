@@ -2084,6 +2084,33 @@ all_done: // pure jump
 }
 
 /*
+ * Be careful in case the dentry is unlinked or renamed. Any mounts
+ * stacked on top of it are going away. We need to make sure that we
+ * don't reveal the underyling dentry during refwalk. In rcuwalk we
+ * catch this via d_seq and another lookup for the name. Give the same
+ * guarantee in refwalk.
+ */
+static bool unlink_may_reveal(struct nameidata *nd, int flags,
+			      struct path *path, struct dentry *dentry)
+{
+	/* ".." and LOOKUP_DOWN may land on an unhashed directory */
+	if (flags & WALK_NOFOLLOW)
+		return false;
+	if (nd->flags & LOOKUP_REVAL)
+		return false;
+	/* We crossed onto a mount and the name led us here while it still existed */
+	if (path->mnt != nd->path.mnt)
+		return false;
+	/* only a name on its way out is flagged */
+	if (likely(!cant_mount(dentry)))
+		return false;
+	if (!d_unlinked(dentry))
+		return false;
+	dput(no_free_ptr(path->dentry));
+	return true;
+}
+
+/*
  * Do we need to follow links? We _really_ want to be able
  * to do this check without having to look at inode->i_op,
  * so we keep a cache of "no, this doesn't need follow_link"
@@ -2112,6 +2139,8 @@ static noinline const char *step_into_slowpath(struct nameidata *nd, int flags,
 			if (unlikely(!inode))
 				return ERR_PTR(-ENOENT);
 		} else {
+			if (unlikely(unlink_may_reveal(nd, flags, &path, dentry)))
+				return ERR_PTR(-ESTALE);
 			dput(nd->path.dentry);
 			if (nd->path.mnt != path.mnt)
 				mntput(nd->path.mnt);
@@ -4528,8 +4557,7 @@ static struct dentry *lookup_fast_for_open(struct nameidata *nd, int open_flag)
 		return dentry;
 
 	if (open_flag & O_CREAT) {
-		/* Discard negative dentries. Need inode_lock to do the create */
-		if (!dentry->d_inode) {
+		if (d_is_negative(dentry)) {
 			if (!(nd->flags & LOOKUP_RCU))
 				dput(dentry);
 			dentry = NULL;
@@ -4712,6 +4740,10 @@ int vfs_tmpfile(struct mnt_idmap *idmap,
 	struct inode *inode;
 	int error;
 	int open_flag = file->f_flags;
+
+	/* A tmpfile is I_LINKABLE, so guard its owner like may_o_create(). */
+	if (!fsuidgid_has_mapping(dir->i_sb, idmap))
+		return -EOVERFLOW;
 
 	/* we want directory to be writable */
 	error = inode_permission(idmap, dir, MAY_WRITE | MAY_EXEC);
@@ -5002,6 +5034,7 @@ struct file *dentry_create(struct path *path, int flags, umode_t mode,
 {
 	struct file *file __free(fput) = NULL;
 	struct dentry *dentry = path->dentry;
+	struct dentry *orig_dentry = dentry;
 	struct dentry *dir = dentry->d_parent;
 	struct inode *dir_inode = d_inode(dir);
 	struct mnt_idmap *idmap;
@@ -5021,8 +5054,17 @@ struct file *dentry_create(struct path *path, int flags, umode_t mode,
 		if (create_error)
 			flags &= ~O_CREAT;
 
+		/* atomic_open will dput(dentry) on error */
+		dget(orig_dentry);
 		dentry = atomic_open(path, dentry, file, flags, mode);
 		error = PTR_ERR_OR_ZERO(dentry);
+
+		if (IS_ERR(dentry))
+			/* keep the original */
+			dentry = orig_dentry;
+		else
+			/* Drop the extra reference */
+			dput(orig_dentry);
 
 		if (unlikely(create_error) && error == -ENOENT)
 			error = create_error;

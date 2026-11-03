@@ -160,6 +160,9 @@ static int ge_put_enum_double(struct snd_kcontrol *kcontrol,
 	unsigned int reg = e->reg;
 	int ret;
 
+	if (item[0] >= e->items)
+		return -EINVAL;
+
 	reg &= ~SDW_SDCA_CTL_CSEL(0x3F);
 	reg |= SDW_SDCA_CTL_CSEL(SDCA_CTL_GE_DETECTED_MODE);
 
@@ -850,7 +853,7 @@ static int q78_read(struct snd_soc_component *component,
 
 	reg_val = snd_soc_component_read(component, reg);
 
-	val = (sign_extend32(reg_val, mc->sign_bit) / mc->shift) - mc->min;
+	val = (sign_extend32(reg_val, mc->sign_bit) / (int)mc->shift) - mc->min;
 
 	return val & GENMASK(mc->sign_bit, 0);
 }

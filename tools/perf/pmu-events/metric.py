@@ -25,7 +25,6 @@ def LoadEvents(directory: str) -> None:
       "cycles",
       "duration_time",
       "instructions",
-      "l2_itlb_misses",
   }
   for file in os.listdir(os.fsencode(directory)):
     filename = os.fsdecode(file)
@@ -619,7 +618,11 @@ class Metric:
 
   def __lt__(self, other):
     """Sort order."""
-    return self.name < other.name
+    if self.name != other.name:
+      return self.name < other.name
+    if not self.expr.Equals(other.expr):
+      return self.expr.ToPerfJson() < other.expr.ToPerfJson()
+    return self.description < other.description
 
   def AddToMetricGroup(self, group):
     """Callback used when being added to a MetricGroup."""

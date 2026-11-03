@@ -561,10 +561,7 @@ static inline sigset_t *sigmask_to_save(void)
 	return res;
 }
 
-static inline int kill_cad_pid(int sig, int priv)
-{
-	return kill_pid(cad_pid, sig, priv);
-}
+int kill_cad_pid(int sig, int priv);
 
 /* These can be the second arg to send_sig_info/send_group_sig_info.  */
 #define SEND_SIG_NOINFO ((struct kernel_siginfo *) 0)
@@ -739,7 +736,7 @@ static inline int thread_group_empty(struct task_struct *p)
 
 extern struct sighand_struct *lock_task_sighand(struct task_struct *task,
 						unsigned long *flags)
-	__acquires(&task->sighand->siglock);
+	__cond_acquires(nonnull, &task->sighand->siglock);
 
 static inline void unlock_task_sighand(struct task_struct *task,
 						unsigned long *flags)

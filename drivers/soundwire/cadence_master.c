@@ -933,6 +933,14 @@ irqreturn_t sdw_cdns_irq(int irq, void *dev_id)
 
 		cdns_read_response(cdns);
 
+		/*
+		 * Clear interrupt before signalling the completion to avoid
+		 * a race between this thread and the main thread starting
+		 * another TX.
+		 */
+		cdns_writel(cdns, CDNS_MCP_INTSTAT, CDNS_MCP_INT_RX_WL);
+		int_status &= ~CDNS_MCP_INT_RX_WL;
+
 		if (defer && defer->msg) {
 			cdns_fill_msg_resp(cdns, defer->msg,
 					   defer->length, 0);
@@ -1695,6 +1703,13 @@ int sdw_cdns_clock_stop(struct sdw_cdns *cdns, bool block_wake)
 	}
 
 	/*
+	 * wait for any in-flight peripheral event handling to complete before stopping the clock.
+	 * No need to disable peripheral interrupts before canceling the work, as the peripheral
+	 * interrupts are already masked before the work is scheduled.
+	 */
+	cancel_work_sync(&cdns->work);
+
+	/*
 	 * Before entering clock stop we mask the Slave
 	 * interrupts. This helps avoid having to deal with e.g. a
 	 * Slave becoming UNATTACHED while the clock is being stopped
@@ -2351,7 +2366,9 @@ int sdw_cdns_prepare_write_dma_buffer(u8 dev_num, struct sdw_bpt_section *sec, i
 		p_data = sec[i].buf;
 
 		while (section_size >= data_per_frame) {
-			header[1] = data_per_frame;
+			header[0] &= ~BIT(0);
+			header[0] |= (data_per_frame >> 8) & BIT(0);
+			header[1] = data_per_frame & 0xFF;
 			header[2] = start_register >> 24 & 0xFF;
 			header[3] = start_register >> 16 & 0xFF;
 			header[4] = start_register >> 8 & 0xFF;
@@ -2377,7 +2394,9 @@ int sdw_cdns_prepare_write_dma_buffer(u8 dev_num, struct sdw_bpt_section *sec, i
 		}
 
 		if (section_size) {
-			header[1] = section_size;
+			header[0] &= ~BIT(0);
+			header[0] |= (section_size >> 8) & BIT(0);
+			header[1] = section_size & 0xFF;
 			header[2] = start_register >> 24 & 0xFF;
 			header[3] = start_register >> 16 & 0xFF;
 			header[4] = start_register >> 8 & 0xFF;
@@ -2428,7 +2447,9 @@ int sdw_cdns_prepare_read_dma_buffer(u8 dev_num, struct sdw_bpt_section *sec, in
 		start_register = sec[i].addr;
 		data_size = sec[i].len;
 		while (data_size >= data_per_frame) {
-			header[1] = data_per_frame;
+			header[0] &= ~BIT(0);
+			header[0] |= (data_per_frame >> 8) & BIT(0);
+			header[1] = data_per_frame & 0xFF;
 			header[2] = start_register >> 24 & 0xFF;
 			header[3] = start_register >> 16 & 0xFF;
 			header[4] = start_register >> 8 & 0xFF;
@@ -2452,7 +2473,9 @@ int sdw_cdns_prepare_read_dma_buffer(u8 dev_num, struct sdw_bpt_section *sec, in
 		}
 
 		if (data_size) {
-			header[1] = data_size;
+			header[0] &= ~BIT(0);
+			header[0] |= (data_size >> 8) & BIT(0);
+			header[1] = data_size & 0xFF;
 			header[2] = start_register >> 24 & 0xFF;
 			header[3] = start_register >> 16 & 0xFF;
 			header[4] = start_register >> 8 & 0xFF;
@@ -2475,7 +2498,9 @@ int sdw_cdns_prepare_read_dma_buffer(u8 dev_num, struct sdw_bpt_section *sec, in
 	/* Add fake frame */
 	header[0] &= ~GENMASK(7, 6);	/* Set inactive flag in BPT/BRA frame heade */
 	while (fake_size >= data_per_frame) {
-		header[1] = data_per_frame;
+		header[0] &= ~BIT(0);
+		header[0] |= (data_per_frame >> 8) & BIT(0);
+		header[1] = data_per_frame & 0xFF;
 		ret = sdw_cdns_prepare_read_pd0_buffer(header, SDW_CDNS_BRA_HDR, p_dma_buffer,
 						       dma_buffer_size, &dma_data_written,
 						       counter);
@@ -2491,7 +2516,9 @@ int sdw_cdns_prepare_read_dma_buffer(u8 dev_num, struct sdw_bpt_section *sec, in
 	}
 
 	if (fake_size) {
-		header[1] = fake_size;
+		header[0] &= ~BIT(0);
+		header[0] |= (fake_size >> 8) & BIT(0);
+		header[1] = fake_size & 0xFF;
 		ret = sdw_cdns_prepare_read_pd0_buffer(header, SDW_CDNS_BRA_HDR, p_dma_buffer,
 						       dma_buffer_size, &dma_data_written,
 						       counter);

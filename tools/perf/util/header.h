@@ -109,6 +109,7 @@ struct perf_header {
 	u64				data_size;
 	u64				feat_offset;
 	DECLARE_BITMAP(adds_features, HEADER_FEAT_BITS);
+	int				last_feat;
 	struct perf_env 	env;
 };
 
@@ -132,6 +133,8 @@ struct perf_header_feature_ops {
 
 extern const char perf_version_string[];
 
+const char *header_feat__name(unsigned int id);
+
 int perf_session__read_header(struct perf_session *session);
 int perf_session__write_header(struct perf_session *session,
 			       struct evlist *evlist,
@@ -154,7 +157,7 @@ int perf_session__inject_header(struct perf_session *session,
 				struct feat_copier *fc,
 				bool write_attrs_after_data);
 
-size_t perf_session__data_offset(const struct evlist *evlist);
+size_t perf_session__data_offset(struct evlist *evlist);
 
 void perf_header__set_feat(struct perf_header *header, int feat);
 void perf_header__clear_feat(struct perf_header *header, int feat);
@@ -170,7 +173,8 @@ int perf_header__process_sections(struct perf_header *header, int fd,
 
 int perf_header__fprintf_info(struct perf_session *s, FILE *fp, bool full);
 
-int perf_event__process_feature(struct perf_session *session,
+int perf_event__process_feature(const struct perf_tool *tool,
+				struct perf_session *session,
 				union perf_event *event);
 int perf_event__process_attr(const struct perf_tool *tool, union perf_event *event,
 			     struct evlist **pevlist);

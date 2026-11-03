@@ -12,7 +12,7 @@
 #include <objtool/arch.h>
 #include <objtool/klp.h>
 #include <objtool/util.h>
-#include <arch/special.h>
+#include <objtool/special.h>
 
 #include <linux/align.h>
 #include <linux/objtool_types.h>
@@ -30,7 +30,9 @@ struct elfs {
 
 struct export {
 	struct hlist_node hash;
-	char *mod, *sym;
+	char *mod;
+	char *sym;
+	bool mod_ns;
 };
 
 static const char * const klp_diff_usage[] = {
@@ -45,11 +47,6 @@ static const struct option klp_diff_options[] = {
 };
 
 static DEFINE_HASHTABLE(exports, 15);
-
-static inline u32 str_hash(const char *str)
-{
-	return jhash(str, strlen(str), 0);
-}
 
 static char *escape_str(const char *orig)
 {
@@ -83,6 +80,35 @@ static char *escape_str(const char *orig)
 	return new;
 }
 
+/*
+ * Convert a build-tree object path to a runtime module name: strip
+ * directory components, replace '-' with '_', and remove file
+ * extensions.  Examples:
+ *
+ *   "arch/x86/kvm/kvm" -> "kvm"
+ *   "arch/x86/kvm/kvm-intel" -> "kvm_intel".
+ *
+ * Used by read_exports() to normalize Module.symvers entries and by
+ * __find_modname() as a fallback when .modinfo lacks a "name=" tag.
+ */
+static char *normalize_modname(char *name)
+{
+	char *slash = strrchr(name, '/');
+
+	if (slash)
+		name = slash + 1;
+
+	for (char *c = name; *c; c++) {
+		if (*c == '-')
+			*c = '_';
+		else if (*c == '.') {
+			*c = '\0';
+			break;
+		}
+	}
+	return name;
+}
+
 static int read_exports(void)
 {
 	const char *symvers = "Module.symvers";
@@ -106,7 +132,7 @@ static int read_exports(void)
 	}
 
 	while (fgets(line, 1024, file)) {
-		char *sym, *mod, *type;
+		char *sym, *mod, *type, *namespace;
 		struct export *export;
 
 		sym = strchr(line, '\t');
@@ -133,6 +159,14 @@ static int read_exports(void)
 
 		*type++ = '\0';
 
+		namespace = strchr(type, '\t');
+		if (!namespace) {
+			ERROR("malformed Module.symvers (namespace) at line %d", line_num);
+			return -1;
+		}
+
+		*namespace++ = '\0';
+
 		if (*sym == '\0' || *mod == '\0') {
 			ERROR("malformed Module.symvers at line %d", line_num);
 			return -1;
@@ -150,11 +184,17 @@ static int read_exports(void)
 			return -1;
 		}
 
+		if (strcmp(export->mod, "vmlinux"))
+			export->mod = normalize_modname(export->mod);
+
 		export->sym = strdup(sym);
 		if (!export->sym) {
 			ERROR_GLIBC("strdup");
 			return -1;
 		}
+
+		/* EXPORT_SYMBOL_FOR_MODULES() */
+		export->mod_ns = strstarts(namespace, "module:");
 
 		hash_add(exports, &export->hash, str_hash(sym));
 	}
@@ -171,7 +211,7 @@ static int read_sym_checksums(struct elf *elf)
 
 	sec = find_section_by_name(elf, ".discard.sym_checksum");
 	if (!sec) {
-		ERROR("'%s' missing .discard.sym_checksum section, file not processed by 'objtool --checksum'?",
+		ERROR("'%s' missing .discard.sym_checksum section, file not processed by 'objtool klp checksum'?",
 		      elf->name);
 		return -1;
 	}
@@ -242,25 +282,39 @@ static struct symbol *next_file_symbol(struct elf *elf, struct symbol *sym)
 static bool is_uncorrelated_static_local(struct symbol *sym)
 {
 	static const char * const vars[] = {
-		"__already_done.",
-		"__func__.",
-		"__key.",
-		"__warned.",
-		"_entry.",
-		"_entry_ptr.",
-		"_rs.",
-		"descriptor.",
-		"CSWTCH.",
+		"__already_done",
+		"__func__",
+		"__key",
+		"__warned",
+		"_entry",
+		"_entry_ptr",
+		"_rs",
+		"descriptor",
+		"CSWTCH",
 	};
+	const char *dot;
 
 	if (!is_object_sym(sym) || !is_local_sym(sym))
 		return false;
 
-	if (!strcmp(sym->sec->name, ".data.once"))
+	/* WARN_ONCE, etc */
+	if (!strcmp(sym->sec->name, ".data..once"))
 		return true;
 
+	dot = strchr(sym->name, '.');
+	if (!dot)
+		return false;
+
 	for (int i = 0; i < ARRAY_SIZE(vars); i++) {
-		if (strstarts(sym->name, vars[i]))
+		size_t len = strlen(vars[i]);
+
+		/* GCC: <var>.<id> */
+		if (strstarts(sym->name, vars[i]) && (sym->name[len] == '.'))
+			return true;
+
+		/* Clang: <func>.<var>[.<id>] */
+		if (strstarts(dot + 1, vars[i]) &&
+		    (dot[1 + len] == '.' || dot[1 + len] == '\0'))
 			return true;
 	}
 
@@ -354,6 +408,37 @@ static bool dont_correlate(struct symbol *sym)
 	       is_special_section(sym->sec) ||
 	       is_special_section_aux(sym->sec) ||
 	       strstarts(sym->name, "__initcall__");
+}
+
+/*
+ * When there is no full name match, try match demangled_name. This would
+ * match original foo.llvm.123 to patched foo.llvm.456.
+ *
+ * Note that, in very rare cases, it is possible to have multiple
+ * foo.llvm.<hash> in the same kernel. When this happens, report error and
+ * fail the diff.
+ */
+static int find_global_symbol_by_demangled_name(struct elf *elf, struct symbol *sym,
+						struct symbol **out_sym)
+{
+	struct symbol *sym2, *result = NULL;
+	int count = 0;
+
+	for_each_sym_by_demangled_name(elf, sym->demangled_name, sym2) {
+		if (is_local_sym(sym2) || sym2->twin)
+			continue;
+
+		count++;
+		result = sym2;
+	}
+
+	if (count > 1) {
+		ERROR("Multiple (%d) correlation candidates for %s", count, sym->name);
+		return -1;
+	}
+
+	*out_sym = result;
+	return 0;
 }
 
 /*
@@ -454,6 +539,23 @@ static int correlate_symbols(struct elfs *e)
 			continue;
 
 		sym2 = find_global_symbol_by_name(e->patched, sym1->name);
+		if (sym2 && !sym2->twin) {
+			sym1->twin = sym2;
+			sym2->twin = sym1;
+		}
+	}
+
+	/*
+	 * Correlate globals with demangled_name.
+	 * A separate loop is needed because we want to finish all the
+	 * full name correlations first.
+	 */
+	for_each_sym(e->orig, sym1) {
+		if (sym1->bind == STB_LOCAL || sym1->twin)
+			continue;
+
+		if (find_global_symbol_by_demangled_name(e->patched, sym1, &sym2))
+			return -1;
 
 		if (sym2 && !sym2->twin && !strcmp(sym1->name, sym2->name)) {
 			sym1->twin = sym2;
@@ -468,65 +570,6 @@ static int correlate_symbols(struct elfs *e)
 	}
 
 	return 0;
-}
-
-/* "sympos" is used by livepatch to disambiguate duplicate symbol names */
-static unsigned long find_sympos(struct elf *elf, struct symbol *sym)
-{
-	bool vmlinux = str_ends_with(objname, "vmlinux.o");
-	unsigned long sympos = 0, nr_matches = 0;
-	bool has_dup = false;
-	struct symbol *s;
-
-	if (sym->bind != STB_LOCAL)
-		return 0;
-
-	if (vmlinux && sym->type == STT_FUNC) {
-		/*
-		 * HACK: Unfortunately, symbol ordering can differ between
-		 * vmlinux.o and vmlinux due to the linker script emitting
-		 * .text.unlikely* before .text*.  Count .text.unlikely* first.
-		 *
-		 * TODO: Disambiguate symbols more reliably (checksums?)
-		 */
-		for_each_sym(elf, s) {
-			if (strstarts(s->sec->name, ".text.unlikely") &&
-			    !strcmp(s->name, sym->name)) {
-				nr_matches++;
-				if (s == sym)
-					sympos = nr_matches;
-				else
-					has_dup = true;
-			}
-		}
-		for_each_sym(elf, s) {
-			if (!strstarts(s->sec->name, ".text.unlikely") &&
-			    !strcmp(s->name, sym->name)) {
-				nr_matches++;
-				if (s == sym)
-					sympos = nr_matches;
-				else
-					has_dup = true;
-			}
-		}
-	} else {
-		for_each_sym(elf, s) {
-			if (!strcmp(s->name, sym->name)) {
-				nr_matches++;
-				if (s == sym)
-					sympos = nr_matches;
-				else
-					has_dup = true;
-			}
-		}
-	}
-
-	if (!sympos) {
-		ERROR("can't find sympos for %s", sym->name);
-		return ULONG_MAX;
-	}
-
-	return has_dup ? sympos : 0;
 }
 
 static int clone_sym_relocs(struct elfs *e, struct symbol *patched_sym);
@@ -568,7 +611,7 @@ static struct symbol *__clone_symbol(struct elf *elf, struct symbol *patched_sym
 			size_t size;
 
 			/* bss doesn't have data */
-			if (patched_sym->sec->data->d_buf)
+			if (patched_sym->sec->data && patched_sym->sec->data->d_buf)
 				data = patched_sym->sec->data->d_buf + patched_sym->offset;
 
 			if (is_sec_sym(patched_sym))
@@ -761,6 +804,9 @@ static struct export *find_export(struct symbol *sym)
 {
 	struct export *export;
 
+	if (is_local_sym(sym))
+		return NULL;
+
 	hash_for_each_possible(exports, export, hash, str_hash(sym->name)) {
 		if (!strcmp(export->sym, sym->name))
 			return export;
@@ -790,18 +836,7 @@ static const char *__find_modname(struct elfs *e)
 		return NULL;
 	}
 
-	for (char *c = name; *c; c++) {
-		if (*c == '/')
-			name = c + 1;
-		else if (*c == '-')
-			*c = '_';
-		else if (*c == '.') {
-			*c = '\0';
-			break;
-		}
-	}
-
-	return name;
+	return normalize_modname(name);
 }
 
 /* Get the object's module name as defined by the kernel (and klp_object) */
@@ -842,11 +877,16 @@ static bool klp_reloc_needed(struct reloc *patched_reloc)
 	 * clusterfunk that is late module patching, the patch module is
 	 * allowed to be loaded before any modules it depends on.
 	 *
-	 * If exported by vmlinux, a normal reloc will do.
+	 * If exported by vmlinux to all modules, a normal reloc will do.
 	 */
 	export = find_export(patched_sym);
-	if (export)
-		return strcmp(export->mod, "vmlinux");
+	if (export) {
+		if (strcmp(export->mod, "vmlinux"))
+			return true;
+
+		/* EXPORT_SYMBOL_FOR_MODULES() gets a klp reloc */
+		return export->mod_ns;
+	}
 
 	if (!patched_sym->twin) {
 		/*
@@ -893,6 +933,13 @@ static int convert_reloc_secsym_to_sym(struct elf *elf, struct reloc *reloc)
 	sym = find_symbol_containing(sec, arch_adjusted_addend(reloc));
 	if (!sym) {
 		/*
+		 * This is presumably an .altinstr_replacement section which is
+		 * empty due to it only having zero-length replacement(s).
+		 */
+		if (!sec_size(sec))
+			return 1;
+
+		/*
 		 * This can happen for special section references to weak code
 		 * whose symbol has been stripped by the linker.
 		 */
@@ -912,6 +959,9 @@ found_sym:
  */
 static int convert_reloc_sym(struct elf *elf, struct reloc *reloc)
 {
+	if (reloc_type(reloc) == R_NONE)
+		return 1;
+
 	if (is_reloc_allowed(reloc))
 		return 0;
 
@@ -928,12 +978,14 @@ static int clone_reloc_klp(struct elfs *e, struct reloc *patched_reloc,
 			   struct section *sec, unsigned long offset,
 			   struct export *export)
 {
+	const char *sym_modname, *sym_orig_name, *sec_objname;
 	struct symbol *patched_sym = patched_reloc->sym;
 	s64 addend = reloc_addend(patched_reloc);
-	const char *sym_modname, *sym_orig_name;
-	static struct section *klp_relocs;
+	char tombstone_name[SYM_NAME_LEN];
 	struct symbol *sym, *klp_sym;
 	unsigned long klp_reloc_off;
+	struct section *klp_relocs;
+	char sec_name[SEC_NAME_LEN];
 	char sym_name[SYM_NAME_LEN];
 	struct klp_reloc klp_reloc;
 	unsigned long sympos;
@@ -946,15 +998,22 @@ static int clone_reloc_klp(struct elfs *e, struct reloc *patched_reloc,
 	/*
 	 * Keep the original reloc intact for now to avoid breaking objtool run
 	 * which relies on proper relocations for many of its features.  This
-	 * will be disabled later by "objtool klp post-link".
+	 * reloc now targets a functionally dead tombstone symbol and will be
+	 * disabled later by "objtool klp post-link".
 	 *
-	 * Convert it to UNDEF (and WEAK to avoid modpost warnings).
+	 * Convert the symbol to UNDEF/WEAK and rename to
+	 * .klp.tombstone.sym_name to prevent modpost from printing warnings or
+	 * creating false module dependencies.  The prefix is hidden from the
+	 * objtool run itself by read_symbols().
 	 */
 
 	sym = patched_sym->clone;
 	if (!sym) {
-		/* STB_WEAK: avoid modpost undefined symbol warnings */
-		sym = elf_create_symbol(e->out, patched_sym->name, NULL,
+		if (snprintf_check(tombstone_name, SYM_NAME_LEN,
+				   KLP_TOMBSTONE_PREFIX "%s", patched_sym->name))
+			return -1;
+
+		sym = elf_create_symbol(e->out, tombstone_name, NULL,
 					STB_WEAK, patched_sym->type, 0, 0);
 		if (!sym)
 			return -1;
@@ -980,7 +1039,7 @@ static int clone_reloc_klp(struct elfs *e, struct reloc *patched_reloc,
 			return -1;
 
 		sym_orig_name = patched_sym->twin->name;
-		sympos = find_sympos(e->orig, patched_sym->twin);
+		sympos = klp_find_sympos(e->orig, patched_sym->twin);
 		if (sympos == ULONG_MAX)
 			return -1;
 	}
@@ -1002,16 +1061,35 @@ static int clone_reloc_klp(struct elfs *e, struct reloc *patched_reloc,
 	}
 
 	/*
-	 * Create the __klp_relocs entry.  This will be converted to an actual
-	 * KLP rela by "objtool klp post-link".
+	 * Create the __klp_relocs.<objname> entry.  This will be converted to
+	 * an actual KLP rela by "objtool klp post-link".
 	 *
 	 * This intermediate step is necessary to prevent corruption by the
 	 * linker, which doesn't know how to properly handle two rela sections
 	 * applying to the same base section.
+	 *
+	 * The objname decides when the reloc gets applied.  A reference to a
+	 * vmlinux symbol goes in the vmlinux section so it gets applied when
+	 * the patch module loads.  Everything else goes in the patched
+	 * object's section, applied when the patched module is loaded.
 	 */
 
+	if (!strcmp(sym_modname, "vmlinux")) {
+		sec_objname = "vmlinux";
+	} else {
+		sec_objname = find_modname(e);
+		if (!sec_objname)
+			return -1;
+	}
+
+	/* section format: __klp_relocs.objname */
+	if (snprintf_check(sec_name, SEC_NAME_LEN,
+			   KLP_RELOCS_SEC ".%s", sec_objname))
+		return -1;
+
+	klp_relocs = find_section_by_name(e->out, sec_name);
 	if (!klp_relocs) {
-		klp_relocs = elf_create_section(e->out, KLP_RELOCS_SEC, 0,
+		klp_relocs = elf_create_section(e->out, sec_name, 0,
 						0, SHT_PROGBITS, 8, SHF_ALLOC);
 		if (!klp_relocs)
 			return -1;
@@ -1152,6 +1230,7 @@ static int clone_sym_relocs(struct elfs *e, struct symbol *patched_sym)
 
 	for_each_reloc(patched_rsec, patched_reloc) {
 		unsigned long offset;
+		int ret;
 
 		if (reloc_offset(patched_reloc) < start ||
 		    reloc_offset(patched_reloc) >= end)
@@ -1165,12 +1244,19 @@ static int clone_sym_relocs(struct elfs *e, struct symbol *patched_sym)
 		    !strcmp(patched_reloc->sym->sec->name, ".altinstr_aux"))
 			continue;
 
-		if (convert_reloc_sym(e->patched, patched_reloc)) {
+		if (arch_alt_ignore_new_reloc(patched_sym->sec,
+					      reloc_offset(patched_reloc)))
+			continue;
+
+		ret = convert_reloc_sym(e->patched, patched_reloc);
+		if (ret < 0) {
 			ERROR_FUNC(patched_rsec->base, reloc_offset(patched_reloc),
 				   "failed to convert reloc sym '%s' to its proper format",
 				   patched_reloc->sym->name);
 			return -1;
 		}
+		if (ret > 0)
+			continue;
 
 		offset = out_sym->offset + (reloc_offset(patched_reloc) - patched_sym->offset);
 
@@ -1247,18 +1333,22 @@ static int create_fake_symbols(struct elf *elf)
 
 	sec = find_section_by_name(elf, ".discard.annotate_data");
 	if (!sec || !sec->rsec)
-		return 0;
+		goto entsize;
 
 	for_each_reloc(sec->rsec, reloc) {
 		unsigned long offset, size;
 		struct reloc *next_reloc;
+		bool last = true;
 
 		if (annotype(elf, sec, reloc) != ANNOTYPE_DATA_SPECIAL)
 			continue;
 
 		offset = reloc_addend(reloc);
 
-		size = 0;
+		/*
+		 * Find the start of the next entry so the fake symbol size can
+		 * be calculated.
+		 */
 		next_reloc = reloc;
 		for_each_reloc_continue(sec->rsec, next_reloc) {
 			if (annotype(elf, sec, next_reloc) != ANNOTYPE_DATA_SPECIAL ||
@@ -1266,10 +1356,15 @@ static int create_fake_symbols(struct elf *elf)
 				continue;
 
 			size = reloc_addend(next_reloc) - offset;
+			last = false;
 			break;
 		}
 
-		if (!size)
+		/*
+		 * If no next entry found, this is the last entry, so its size
+		 * is from the current offset to the end of the section.
+		 */
+		if (last)
 			size = sec_size(reloc->sym->sec) - offset;
 
 		if (create_fake_symbol(elf, reloc->sym->sec, offset, size))
@@ -1279,7 +1374,7 @@ static int create_fake_symbols(struct elf *elf)
 	/*
 	 * 2) Make symbols for sh_entsize, and simple arrays of pointers:
 	 */
-
+entsize:
 	for_each_sec(elf, sec) {
 		unsigned int entry_size;
 		unsigned long offset;
@@ -1313,6 +1408,7 @@ static int create_fake_symbols(struct elf *elf)
 /* Keep a special section entry if it references an included function */
 static bool should_keep_special_sym(struct elf *elf, struct symbol *sym)
 {
+	bool annotate_insn = !strcmp(sym->sec->name, ".discard.annotate_insn");
 	struct reloc *reloc;
 
 	if (is_sec_sym(sym) || !sym->sec->rsec)
@@ -1322,7 +1418,16 @@ static bool should_keep_special_sym(struct elf *elf, struct symbol *sym)
 		if (convert_reloc_sym(elf, reloc))
 			continue;
 
-		if (is_func_sym(reloc->sym) && reloc->sym->included)
+		if (!reloc->sym->clone || is_undef_sym(reloc->sym->clone))
+			continue;
+
+		/*
+		 * Keep special section references to cloned functions.
+		 * In some cases annotate_insn can also reference cloned alt
+		 * replacement fake symbols; keep those references as well.
+		 */
+		if (is_func_sym(reloc->sym) ||
+		    (annotate_insn && is_notype_sym(reloc->sym)))
 			return true;
 	}
 
@@ -1466,13 +1571,26 @@ static int clone_special_section(struct elfs *e, struct section *patched_sec)
 /* Extract only the needed bits from special sections */
 static int clone_special_sections(struct elfs *e)
 {
-	struct section *patched_sec;
+	struct section *sec, *annotate_insn = NULL;
 
-	for_each_sec(e->patched, patched_sec) {
-		if (is_special_section(patched_sec)) {
-			if (clone_special_section(e, patched_sec))
+	for_each_sec(e->patched, sec) {
+		if (is_special_section(sec)) {
+			if (!strcmp(sec->name, ".discard.annotate_insn")) {
+				annotate_insn = sec;
+				continue;
+			}
+			if (clone_special_section(e, sec))
 				return -1;
 		}
+	}
+
+	/*
+	 * Do .discard.annotate_insn last, it can reference other special
+	 * sections (alt replacements) so they need to be cloned first.
+	 */
+	if (annotate_insn) {
+		if (clone_special_section(e, annotate_insn))
+			return -1;
 	}
 
 	return 0;
@@ -1577,7 +1695,7 @@ static int create_klp_sections(struct elfs *e)
 
 		/* klp_func_ext.sympos */
 		BUILD_BUG_ON(sizeof(sympos) != sizeof_field(struct klp_func_ext, sympos));
-		sympos = find_sympos(e->orig, sym->clone->twin);
+		sympos = klp_find_sympos(e->orig, sym->clone->twin);
 		if (sympos == ULONG_MAX)
 			return -1;
 		memcpy(func_data + offsetof(struct klp_func_ext, sympos), &sympos,
@@ -1723,6 +1841,9 @@ int cmd_klp_diff(int argc, const char **argv)
 	e.out = NULL;
 
 	if (!e.orig || !e.patched)
+		return -1;
+
+	if (klp_sympos_init(e.orig))
 		return -1;
 
 	if (read_exports())
