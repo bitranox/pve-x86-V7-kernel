@@ -106,7 +106,7 @@ static int luo_flb_file_preserve_one(struct liveupdate_flb *flb)
 	struct luo_flb_private *private = luo_flb_get_private(flb);
 
 	scoped_guard(mutex, &private->outgoing.lock) {
-		if (!private->outgoing.count) {
+		if (!refcount_read(&private->outgoing.count)) {
 			struct liveupdate_flb_op_args args = {0};
 			int err;
 
@@ -116,20 +116,21 @@ static int luo_flb_file_preserve_one(struct liveupdate_flb *flb)
 				return err;
 			private->outgoing.data = args.data;
 			private->outgoing.obj = args.obj;
+			refcount_set(&private->outgoing.count, 1);
+		} else {
+			refcount_inc(&private->outgoing.count);
 		}
-		private->outgoing.count++;
 	}
 
 	return 0;
 }
 
-static void luo_flb_file_unpreserve_one(struct liveupdate_flb *flb)
+void liveupdate_flb_put_outgoing(struct liveupdate_flb *flb)
 {
 	struct luo_flb_private *private = luo_flb_get_private(flb);
 
 	scoped_guard(mutex, &private->outgoing.lock) {
-		private->outgoing.count--;
-		if (!private->outgoing.count) {
+		if (refcount_dec_and_test(&private->outgoing.count)) {
 			struct liveupdate_flb_op_args args = {0};
 
 			args.flb = flb;
@@ -153,12 +154,15 @@ static int luo_flb_retrieve_one(struct liveupdate_flb *flb)
 	bool found = false;
 	int err;
 
-	guard(mutex)(&private->incoming.lock);
+	lockdep_assert_held(&private->incoming.lock);
 
 	if (private->incoming.finished)
 		return -ENODATA;
 
-	if (private->incoming.retrieved)
+	if (private->incoming.retrieve_status < 0)
+		return private->incoming.retrieve_status;
+
+	if (private->incoming.retrieve_status > 0)
 		return 0;
 
 	if (!fh->active)
@@ -167,7 +171,7 @@ static int luo_flb_retrieve_one(struct liveupdate_flb *flb)
 	for (int i = 0; i < fh->header_ser->count; i++) {
 		if (!strcmp(fh->ser[i].name, flb->compatible)) {
 			private->incoming.data = fh->ser[i].data;
-			private->incoming.count = fh->ser[i].count;
+			refcount_set(&private->incoming.count, fh->ser[i].count);
 			found = true;
 			break;
 		}
@@ -180,42 +184,40 @@ static int luo_flb_retrieve_one(struct liveupdate_flb *flb)
 	args.data = private->incoming.data;
 
 	err = flb->ops->retrieve(&args);
-	if (err)
+	if (err) {
+		private->incoming.retrieve_status = err;
 		return err;
+	}
 
 	private->incoming.obj = args.obj;
-	private->incoming.retrieved = true;
+	private->incoming.retrieve_status = 1;
 
 	return 0;
 }
 
-static void luo_flb_file_finish_one(struct liveupdate_flb *flb)
+void liveupdate_flb_put_incoming(struct liveupdate_flb *flb)
 {
 	struct luo_flb_private *private = luo_flb_get_private(flb);
-	u64 count;
+	struct liveupdate_flb_op_args args = {0};
 
-	scoped_guard(mutex, &private->incoming.lock)
-		count = --private->incoming.count;
+	scoped_guard(mutex, &private->incoming.lock) {
+		if (!refcount_dec_and_test(&private->incoming.count))
+			return;
 
-	if (!count) {
-		struct liveupdate_flb_op_args args = {0};
-
-		if (!private->incoming.retrieved) {
+		if (private->incoming.retrieve_status <= 0) {
 			int err = luo_flb_retrieve_one(flb);
 
 			if (WARN_ON(err))
 				return;
 		}
 
-		scoped_guard(mutex, &private->incoming.lock) {
-			args.flb = flb;
-			args.obj = private->incoming.obj;
-			flb->ops->finish(&args);
+		args.flb = flb;
+		args.obj = private->incoming.obj;
+		flb->ops->finish(&args);
 
-			private->incoming.data = 0;
-			private->incoming.obj = NULL;
-			private->incoming.finished = true;
-		}
+		private->incoming.data = 0;
+		private->incoming.obj = NULL;
+		private->incoming.finished = true;
 	}
 }
 
@@ -250,7 +252,7 @@ int luo_flb_file_preserve(struct liveupdate_file_handler *fh)
 
 exit_err:
 	list_for_each_entry_continue_reverse(iter, flb_list, list)
-		luo_flb_file_unpreserve_one(iter->flb);
+		liveupdate_flb_put_outgoing(iter->flb);
 
 	return err;
 }
@@ -273,7 +275,7 @@ void luo_flb_file_unpreserve(struct liveupdate_file_handler *fh)
 	struct luo_flb_link *iter;
 
 	list_for_each_entry_reverse(iter, flb_list, list)
-		luo_flb_file_unpreserve_one(iter->flb);
+		liveupdate_flb_put_outgoing(iter->flb);
 }
 
 /**
@@ -293,7 +295,7 @@ void luo_flb_file_finish(struct liveupdate_file_handler *fh)
 	struct luo_flb_link *iter;
 
 	list_for_each_entry_reverse(iter, flb_list, list)
-		luo_flb_file_finish_one(iter->flb);
+		liveupdate_flb_put_incoming(iter->flb);
 }
 
 /**
@@ -501,6 +503,8 @@ int liveupdate_flb_get_incoming(struct liveupdate_flb *flb, void **objp)
 	if (!liveupdate_enabled())
 		return -EOPNOTSUPP;
 
+	guard(mutex)(&private->incoming.lock);
+
 	if (!private->incoming.obj) {
 		int err = luo_flb_retrieve_one(flb);
 
@@ -508,7 +512,7 @@ int liveupdate_flb_get_incoming(struct liveupdate_flb *flb, void **objp)
 			return err;
 	}
 
-	guard(mutex)(&private->incoming.lock);
+	refcount_inc(&private->incoming.count);
 	*objp = private->incoming.obj;
 
 	return 0;
@@ -536,6 +540,10 @@ int liveupdate_flb_get_outgoing(struct liveupdate_flb *flb, void **objp)
 		return -EOPNOTSUPP;
 
 	guard(mutex)(&private->outgoing.lock);
+	if (!private->outgoing.obj)
+		return -ENOENT;
+
+	refcount_inc(&private->outgoing.count);
 	*objp = private->outgoing.obj;
 
 	return 0;
@@ -640,12 +648,13 @@ void luo_flb_serialize(void)
 
 	list_private_for_each_entry(gflb, &luo_flb_global.list, private.list) {
 		struct luo_flb_private *private = luo_flb_get_private(gflb);
+		long count = refcount_read(&private->outgoing.count);
 
-		if (private->outgoing.count > 0) {
+		if (count > 0) {
 			strscpy(fh->ser[i].name, gflb->compatible,
 				sizeof(fh->ser[i].name));
 			fh->ser[i].data = private->outgoing.data;
-			fh->ser[i].count = private->outgoing.count;
+			fh->ser[i].count = count;
 			i++;
 		}
 	}

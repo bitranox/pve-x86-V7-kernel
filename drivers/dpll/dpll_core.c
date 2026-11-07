@@ -910,11 +910,13 @@ __dpll_pin_unregister(struct dpll_device *dpll, struct dpll_pin *pin,
 		      const struct dpll_pin_ops *ops, void *priv, void *cookie)
 {
 	ASSERT_DPLL_PIN_REGISTERED(pin);
-	dpll_pin_ref_sync_pair_del(pin->id);
+	dpll_pin_delete_ntf(pin);
 	dpll_xa_ref_pin_del(&dpll->pin_refs, pin, ops, priv, cookie);
 	dpll_xa_ref_dpll_del(&pin->dpll_refs, dpll, ops, priv, cookie);
-	if (xa_empty(&pin->dpll_refs))
+	if (xa_empty(&pin->dpll_refs)) {
+		dpll_pin_ref_sync_pair_del(pin->id);
 		xa_clear_mark(&dpll_pin_xa, pin->id, DPLL_REGISTERED);
+	}
 }
 
 /**
@@ -936,7 +938,6 @@ void dpll_pin_unregister(struct dpll_device *dpll, struct dpll_pin *pin,
 		return;
 
 	mutex_lock(&dpll_lock);
-	dpll_pin_delete_ntf(pin);
 	__dpll_pin_unregister(dpll, pin, ops, priv, NULL);
 	mutex_unlock(&dpll_lock);
 }
@@ -991,9 +992,9 @@ int dpll_pin_on_pin_register(struct dpll_pin *parent, struct dpll_pin *pin,
 dpll_unregister:
 	xa_for_each(&parent->dpll_refs, i, ref)
 		if (i < stop) {
+			dpll_pin_delete_ntf(pin);
 			__dpll_pin_unregister(ref->dpll, pin, ops, priv,
 					      parent);
-			dpll_pin_delete_ntf(pin);
 		}
 	dpll_xa_ref_pin_del(&pin->parent_refs, parent, ops, priv, pin);
 unlock:
@@ -1015,14 +1016,19 @@ EXPORT_SYMBOL_GPL(dpll_pin_on_pin_register);
 void dpll_pin_on_pin_unregister(struct dpll_pin *parent, struct dpll_pin *pin,
 				const struct dpll_pin_ops *ops, void *priv)
 {
+	struct dpll_pin_registration *reg;
 	struct dpll_pin_ref *ref;
 	unsigned long i;
 
 	mutex_lock(&dpll_lock);
-	dpll_pin_delete_ntf(pin);
-	dpll_xa_ref_pin_del(&pin->parent_refs, parent, ops, priv, pin);
-	xa_for_each(&pin->dpll_refs, i, ref)
+	xa_for_each(&pin->dpll_refs, i, ref) {
+		reg = dpll_pin_registration_find(ref, ops, priv, parent);
+		if (!reg)
+			continue;
+		dpll_pin_delete_ntf(pin);
 		__dpll_pin_unregister(ref->dpll, pin, ops, priv, parent);
+	}
+	dpll_xa_ref_pin_del(&pin->parent_refs, parent, ops, priv, pin);
 	mutex_unlock(&dpll_lock);
 }
 EXPORT_SYMBOL_GPL(dpll_pin_on_pin_unregister);
@@ -1057,12 +1063,8 @@ EXPORT_SYMBOL_GPL(dpll_pin_ref_sync_pair_add);
 static struct dpll_device_registration *
 dpll_device_registration_first(struct dpll_device *dpll)
 {
-	struct dpll_device_registration *reg;
-
-	reg = list_first_entry_or_null((struct list_head *)&dpll->registration_list,
-				       struct dpll_device_registration, list);
-	WARN_ON(!reg);
-	return reg;
+	return list_first_entry_or_null((struct list_head *)&dpll->registration_list,
+					struct dpll_device_registration, list);
 }
 
 void *dpll_priv(struct dpll_device *dpll)
@@ -1070,6 +1072,8 @@ void *dpll_priv(struct dpll_device *dpll)
 	struct dpll_device_registration *reg;
 
 	reg = dpll_device_registration_first(dpll);
+	if (!reg)
+		return NULL;
 	return reg->priv;
 }
 
@@ -1078,6 +1082,8 @@ const struct dpll_device_ops *dpll_device_ops(struct dpll_device *dpll)
 	struct dpll_device_registration *reg;
 
 	reg = dpll_device_registration_first(dpll);
+	if (!reg)
+		return NULL;
 	return reg->ops;
 }
 

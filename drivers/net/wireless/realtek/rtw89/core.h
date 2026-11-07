@@ -5199,6 +5199,7 @@ enum rtw89_flags {
 	RTW89_FLAG_CHANGING_INTERFACE,
 	RTW89_FLAG_HW_RFKILL_STATE,
 	RTW89_FLAG_UNPLUGGED,
+	RTW89_FLAG_SHUTDOWN,
 
 	NUM_OF_RTW89_FLAGS,
 };
@@ -5288,9 +5289,6 @@ DECLARE_EWMA(thermal, 4, 4);
 struct rtw89_phy_stat {
 	struct ewma_thermal avg_thermal[RF_PATH_MAX];
 	u8 last_thermal_max;
-	struct ewma_rssi bcn_rssi;
-	struct rtw89_pkt_stat cur_pkt_stat;
-	struct rtw89_pkt_stat last_pkt_stat;
 	struct rtw89_beacon_stat bcn_stat;
 };
 
@@ -6227,6 +6225,9 @@ struct rtw89_dev {
 		struct rtw89_dig_info dig;
 		struct rtw89_phy_ch_info ch_info;
 		struct rtw89_edcca_bak edcca_bak;
+		struct ewma_rssi bcn_rssi;
+		struct rtw89_pkt_stat cur_pkt_stat;
+		struct rtw89_pkt_stat last_pkt_stat;
 	} bbs[RTW89_PHY_NUM];
 
 	struct wiphy_delayed_work track_work;
@@ -6434,6 +6435,9 @@ static inline void rtw89_assoc_link_clr(struct rtw89_sta_link *rtwsta_link)
 static inline struct rtw89_sta_link *
 rtw89_assoc_link_rcu_dereference(struct rtw89_dev *rtwdev, u8 macid)
 {
+	if (unlikely(macid >= RTW89_MAX_MAC_ID_NUM))
+		return NULL;
+
 	return rcu_dereference(rtwdev->assoc_link_on_macid[macid]);
 }
 

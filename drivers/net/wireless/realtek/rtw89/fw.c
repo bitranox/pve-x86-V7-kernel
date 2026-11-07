@@ -3195,14 +3195,15 @@ int rtw89_fw_h2c_lps_ml_cmn_info(struct rtw89_dev *rtwdev,
 				 struct rtw89_vif *rtwvif)
 {
 	const struct rtw89_phy_bb_gain_info_be *gain = &rtwdev->bb_gain.be;
-	struct rtw89_pkt_stat *pkt_stat = &rtwdev->phystat.cur_pkt_stat;
 	static const u8 bcn_bw_ofst[] = {0, 0, 0, 3, 6, 9, 0, 12};
 	const struct rtw89_chip_info *chip = rtwdev->chip;
 	struct rtw89_efuse *efuse = &rtwdev->efuse;
 	struct rtw89_h2c_lps_ml_cmn_info *h2c;
 	struct rtw89_vif_link *rtwvif_link;
+	struct rtw89_pkt_stat *pkt_stat;
 	const struct rtw89_chan *chan;
 	u8 bw_idx = RTW89_BB_BW_20_40;
+	struct rtw89_bb_ctx *bb;
 	u32 len = sizeof(*h2c);
 	unsigned int link_id;
 	struct sk_buff *skb;
@@ -3233,11 +3234,14 @@ int rtw89_fw_h2c_lps_ml_cmn_info(struct rtw89_dev *rtwdev,
 		path = rtwvif_link->phy_idx == RTW89_PHY_1 ? RF_PATH_B : RF_PATH_A;
 		chan = rtw89_chan_get(rtwdev, rtwvif_link->chanctx_idx);
 		gain_band = rtw89_subband_to_gain_band_be(chan->subband_type);
+		bb = rtw89_get_bb_ctx(rtwdev, rtwvif_link->phy_idx);
 
 		h2c->central_ch[rtwvif_link->phy_idx] = chan->channel;
 		h2c->pri_ch[rtwvif_link->phy_idx] = chan->primary_channel;
 		h2c->band[rtwvif_link->phy_idx] = chan->band_type;
 		h2c->bw[rtwvif_link->phy_idx] = chan->band_width;
+
+		pkt_stat = &bb->cur_pkt_stat;
 		if (pkt_stat->beacon_rate < RTW89_HW_RATE_OFDM6)
 			h2c->bcn_rate_type[rtwvif_link->phy_idx] = 0x1;
 		else
@@ -3393,7 +3397,7 @@ int rtw89_fw_h2c_lps_ml_cmn_info_v1(struct rtw89_dev *rtwdev,
 	h2c->rfe_type = efuse->rfe_type;
 	h2c->rssi_main = U8_MAX;
 
-	memset(h2c->link_id, 0xfe, RTW89_BB_PS_LINK_BUF_MAX);
+	memset(h2c->link_id, RTW89_BB_PS_LINK_ID_SKIP, RTW89_BB_PS_LINK_BUF_MAX);
 
 	rtw89_vif_for_each_link(rtwvif, rtwvif_link, link_id) {
 		u8 phy_idx = rtwvif_link->phy_idx;
@@ -3401,7 +3405,7 @@ int rtw89_fw_h2c_lps_ml_cmn_info_v1(struct rtw89_dev *rtwdev,
 		bb = rtw89_get_bb_ctx(rtwdev, phy_idx);
 		chan = rtw89_chan_get(rtwdev, rtwvif_link->chanctx_idx);
 
-		h2c->link_id[phy_idx] = phy_idx;
+		h2c->link_id[phy_idx] = link_id;
 		h2c->central_ch[phy_idx] = chan->channel;
 		h2c->pri_ch[phy_idx] = chan->primary_channel;
 		h2c->band[phy_idx] = chan->band_type;
@@ -3683,7 +3687,7 @@ int rtw89_fw_h2c_default_cmac_tbl_be(struct rtw89_dev *rtwdev,
 		  le32_encode_bits(4, BE_CCTL_INFO_W1_RTS_RTY_LOWEST_RATE);
 	h2c->m1 = cpu_to_le32(BE_CCTL_INFO_W1_ALL);
 
-	h2c->w1 = le32_encode_bits(preld, BE_CCTL_INFO_W2_PRELOAD_ENABLE);
+	h2c->w2 = le32_encode_bits(preld, BE_CCTL_INFO_W2_PRELOAD_ENABLE);
 	h2c->m2 = cpu_to_le32(BE_CCTL_INFO_W2_ALL);
 
 	h2c->m3 = cpu_to_le32(BE_CCTL_INFO_W3_ALL);
@@ -8202,7 +8206,7 @@ static int rtw89_update_6ghz_rnr_chan_ax(struct rtw89_dev *rtwdev,
 	struct sk_buff *skb;
 	bool found;
 	int ret = 0;
-	u8 i;
+	u32 i;
 
 	if (!req->n_6ghz_params)
 		return 0;

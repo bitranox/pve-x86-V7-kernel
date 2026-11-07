@@ -349,7 +349,7 @@
 		};
 
 		opp-1094400000 {
-			opp-hz = /bits/ 64 <109440000>;
+			opp-hz = /bits/ 64 <1094400000>;
 			opp-peak-kBps = <(1017600 * 4) (940800 * 16)>;
 		};
 
@@ -666,6 +666,9 @@
 			clocks = <&rpmhcc RPMH_CXO_CLK>,
 				 <&rpmhcc RPMH_CXO_CLK_A>,
 				 <&sleep_clk>;
+			clock-names = "bi_tcxo",
+				      "bi_tcxo_ao",
+				      "sleep_clk";
 
 			#clock-cells = <1>;
 			#reset-cells = <1>;

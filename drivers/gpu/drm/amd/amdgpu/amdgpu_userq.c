@@ -156,7 +156,7 @@ static void amdgpu_userq_hang_detect_work(struct work_struct *work)
 	struct dma_fence *fence;
 	struct amdgpu_userq_mgr *uq_mgr;
 
-	if (!queue || !queue->userq_mgr)
+	if (!queue->userq_mgr)
 		return;
 
 	uq_mgr = queue->userq_mgr;
@@ -177,7 +177,7 @@ static void amdgpu_userq_hang_detect_work(struct work_struct *work)
 void amdgpu_userq_start_hang_detect_work(struct amdgpu_usermode_queue *queue)
 {
 	struct amdgpu_device *adev;
-	unsigned long timeout_ms;
+	unsigned long timeout_jiffies;
 
 	if (!queue || !queue->userq_mgr || !queue->userq_mgr->adev)
 		return;
@@ -186,23 +186,36 @@ void amdgpu_userq_start_hang_detect_work(struct amdgpu_usermode_queue *queue)
 	/* Determine timeout based on queue type */
 	switch (queue->queue_type) {
 	case AMDGPU_RING_TYPE_GFX:
-		timeout_ms = adev->gfx_timeout;
+		timeout_jiffies = adev->gfx_timeout;
 		break;
 	case AMDGPU_RING_TYPE_COMPUTE:
-		timeout_ms = adev->compute_timeout;
+		timeout_jiffies = adev->compute_timeout;
 		break;
 	case AMDGPU_RING_TYPE_SDMA:
-		timeout_ms = adev->sdma_timeout;
+		timeout_jiffies = adev->sdma_timeout;
 		break;
 	default:
-		timeout_ms = adev->gfx_timeout;
+		timeout_jiffies = adev->gfx_timeout;
 		break;
 	}
 
 	/* Store the fence to monitor and schedule hang detection */
 	WRITE_ONCE(queue->hang_detect_fence, queue->last_fence);
 	schedule_delayed_work(&queue->hang_detect_work,
-		     msecs_to_jiffies(timeout_ms));
+		     timeout_jiffies);
+}
+
+void amdgpu_userq_process_fence_irq(struct amdgpu_device *adev, u32 doorbell)
+{
+	struct xarray *xa = &adev->userq_doorbell_xa;
+	struct amdgpu_usermode_queue *queue;
+	unsigned long flags;
+
+	xa_lock_irqsave(xa, flags);
+	queue = xa_load(xa, doorbell);
+	if (queue)
+		amdgpu_userq_fence_driver_process(queue->fence_drv);
+	xa_unlock_irqrestore(xa, flags);
 }
 
 static void amdgpu_userq_init_hang_detect_work(struct amdgpu_usermode_queue *queue)
@@ -523,16 +536,20 @@ int amdgpu_userq_create_object(struct amdgpu_userq_mgr *uq_mgr,
 		goto free_obj;
 	}
 
+	r = amdgpu_bo_pin(userq_obj->obj, AMDGPU_GEM_DOMAIN_GTT);
+	if (r)
+		goto unresv;
+
 	r = amdgpu_ttm_alloc_gart(&(userq_obj->obj)->tbo);
 	if (r) {
 		drm_file_err(uq_mgr->file, "Failed to alloc GART for userqueue object (%d)", r);
-		goto unresv;
+		goto unpin_bo;
 	}
 
 	r = amdgpu_bo_kmap(userq_obj->obj, &userq_obj->cpu_ptr);
 	if (r) {
 		drm_file_err(uq_mgr->file, "Failed to map BO for userqueue (%d)", r);
-		goto unresv;
+		goto unpin_bo;
 	}
 
 	userq_obj->gpu_addr = amdgpu_bo_gpu_offset(userq_obj->obj);
@@ -540,11 +557,13 @@ int amdgpu_userq_create_object(struct amdgpu_userq_mgr *uq_mgr,
 	memset(userq_obj->cpu_ptr, 0, size);
 	return 0;
 
+unpin_bo:
+	amdgpu_bo_unpin(userq_obj->obj);
 unresv:
 	amdgpu_bo_unreserve(userq_obj->obj);
-
 free_obj:
 	amdgpu_bo_unref(&userq_obj->obj);
+
 	return r;
 }
 
@@ -552,6 +571,7 @@ void amdgpu_userq_destroy_object(struct amdgpu_userq_mgr *uq_mgr,
 				 struct amdgpu_userq_obj *userq_obj)
 {
 	amdgpu_bo_kunmap(userq_obj->obj);
+	amdgpu_bo_unpin(userq_obj->obj);
 	amdgpu_bo_unref(&userq_obj->obj);
 }
 
@@ -563,6 +583,7 @@ amdgpu_userq_get_doorbell_index(struct amdgpu_userq_mgr *uq_mgr,
 	uint64_t index;
 	struct drm_gem_object *gobj;
 	struct amdgpu_userq_obj *db_obj = db_info->db_obj;
+	struct amdgpu_bo *abo;
 	int r, db_size;
 
 	gobj = drm_gem_object_lookup(filp, db_info->doorbell_handle);
@@ -571,7 +592,17 @@ amdgpu_userq_get_doorbell_index(struct amdgpu_userq_mgr *uq_mgr,
 		return -EINVAL;
 	}
 
-	db_obj->obj = amdgpu_bo_ref(gem_to_amdgpu_bo(gobj));
+	/*
+	 * Pinning a regular BO into the doorbell domain would discard its
+	 * contents, possibly those of a buffer shared by another client.
+	 */
+	abo = gem_to_amdgpu_bo(gobj);
+	if (!(abo->preferred_domains & AMDGPU_GEM_DOMAIN_DOORBELL)) {
+		drm_gem_object_put(gobj);
+		return -EINVAL;
+	}
+
+	db_obj->obj = amdgpu_bo_ref(abo);
 	drm_gem_object_put(gobj);
 
 	r = amdgpu_bo_reserve(db_obj->obj, true);
@@ -888,7 +919,12 @@ amdgpu_userq_create(struct drm_file *filp, union drm_amdgpu_userq *args)
 	else
 		skip_map_queue = false;
 	if (!skip_map_queue) {
+		/* Serialize the map against an in-progress GPU reset (MES is
+		 * unresponsive during recovery), matching amdgpu_userq_cleanup().
+		 */
+		down_read(&adev->reset_domain->sem);
 		r = amdgpu_userq_map_helper(queue);
+		up_read(&adev->reset_domain->sem);
 		if (r) {
 			drm_file_err(uq_mgr->file, "Failed to map Queue\n");
 			xa_erase(&uq_mgr->userq_xa, qid);
@@ -1231,7 +1267,7 @@ retry_lock:
 			bo = range->bo;
 			ret = amdgpu_ttm_tt_get_user_pages(bo, range);
 			if (ret)
-				goto unlock_all;
+				goto free_ranges;
 		}
 
 		invalidated = true;
@@ -1258,6 +1294,7 @@ retry_lock:
 
 unlock_all:
 	drm_exec_fini(&exec);
+free_ranges:
 	xa_for_each(&xa, tmp_key, range) {
 		if (!range)
 			continue;
@@ -1583,14 +1620,11 @@ void amdgpu_userq_pre_reset(struct amdgpu_device *adev)
 {
 	const struct amdgpu_userq_funcs *userq_funcs;
 	struct amdgpu_usermode_queue *queue;
-	struct amdgpu_userq_mgr *uqm;
 	unsigned long queue_id;
 
+	/* TODO: We probably need a new lock for the queue state */
 	xa_for_each(&adev->userq_doorbell_xa, queue_id, queue) {
-		uqm = queue->userq_mgr;
-		cancel_delayed_work_sync(&uqm->resume_work);
 		if (queue->state == AMDGPU_USERQ_STATE_MAPPED) {
-			amdgpu_userq_wait_for_last_fence(queue);
 			userq_funcs = adev->userq_funcs[queue->queue_type];
 			userq_funcs->unmap(queue);
 			/* just mark all queues as hung at this point.
@@ -1598,8 +1632,12 @@ void amdgpu_userq_pre_reset(struct amdgpu_device *adev)
 			 * in amdgpu_userq_post_reset() if vram is not lost
 			 */
 			queue->state = AMDGPU_USERQ_STATE_HUNG;
-			amdgpu_userq_fence_driver_force_completion(queue);
 		}
+		/* Force-complete any pending fence regardless of queue state so
+		 * that eviction/suspend and queue teardown waiters don't block
+		 * forever on a fence that will never signal after the reset.
+		 */
+		amdgpu_userq_fence_driver_force_completion(queue);
 	}
 }
 

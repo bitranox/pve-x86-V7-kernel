@@ -376,7 +376,8 @@ int expr__find_ids(const char *expr, const char *one,
 	if (one)
 		expr__del_id(ctx, one);
 
-	return ret;
+	/* A positive value means syntax error, convert to -EINVAL */
+	return ret > 0 ? -EINVAL : ret;
 }
 
 double expr_id_data__value(const struct expr_id_data *data)
@@ -449,7 +450,7 @@ double expr__has_event(const struct expr_parse_ctx *ctx, bool compute_ids, const
 		ret = parse_event(tmp, id) ? 0 : 1;
 	}
 out:
-	evlist__delete(tmp);
+	evlist__put(tmp);
 	return ret;
 }
 

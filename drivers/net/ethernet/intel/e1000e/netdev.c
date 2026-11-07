@@ -25,6 +25,7 @@
 #include <linux/pm_runtime.h>
 #include <linux/prefetch.h>
 #include <linux/suspend.h>
+#include <linux/dmi.h>
 
 #include "e1000.h"
 #define CREATE_TRACE_POINTS
@@ -56,6 +57,24 @@ static const struct e1000_info *e1000_info_tbl[] = {
 	[board_pch_adp]		= &e1000_pch_adp_info,
 	[board_pch_mtp]		= &e1000_pch_mtp_info,
 	[board_pch_ptp]		= &e1000_pch_ptp_info,
+};
+
+static const struct dmi_system_id disable_k1_list[] = {
+	{
+		.ident = "Dell Pro 16 Plus PB16250",
+		.matches = {
+			DMI_MATCH(DMI_SYS_VENDOR, "Dell Inc."),
+			DMI_MATCH(DMI_PRODUCT_NAME, "Dell Pro 16 Plus PB16250"),
+		},
+	},
+	{
+		.ident = "Lenovo ThinkPad P14s Gen 5",
+		.matches = {
+			DMI_MATCH(DMI_SYS_VENDOR, "LENOVO"),
+			DMI_MATCH(DMI_PRODUCT_VERSION, "ThinkPad P14s Gen 5"),
+		},
+	},
+	{}
 };
 
 struct e1000_reg_info {
@@ -4099,6 +4118,15 @@ void e1000e_reset(struct e1000_adapter *adapter)
 	adapter->tx_fifo_limit = min_t(u32, ((er32(PBA) >> 16) << 10) - 96,
 				       24 << 10);
 
+	/* TSO erratum (82571/82572 #76, 82574 #17, 82583V #7, also seen on
+	 * I219): when the first buffer of a TSO packet is larger than
+	 * 3 * (max_read_request - 4) bytes and a 4 KB boundary lies just
+	 * after its headers, the NIC repeats a read, sends wrong data with a
+	 * correct checksum and then hangs. Keep the headers in a first buffer
+	 * no larger than that.
+	 */
+	adapter->tx_hdr_buf_max = 3 * (pcie_get_readrq(adapter->pdev) - 4);
+
 	/* Disable Adaptive Interrupt Moderation if 2 full packets cannot
 	 * fit in receive buffer.
 	 */
@@ -5586,6 +5614,8 @@ static int e1000_tx_map(struct e1000_ring *tx_ring, struct sk_buff *skb,
 	while (len) {
 		buffer_info = &tx_ring->buffer_info[i];
 		size = min(len, max_per_txd);
+		if (!offset && skb_is_gso(skb))
+			size = min(size, adapter->tx_hdr_buf_max);
 
 		buffer_info->length = size;
 		buffer_info->time_stamp = jiffies;
@@ -5859,6 +5889,9 @@ static netdev_tx_t e1000_xmit_frame(struct sk_buff *skb,
 	/* reserve a descriptor for the offload context */
 	if ((mss) || (skb->ip_summed == CHECKSUM_PARTIAL))
 		count++;
+	/* spare descriptor: e1000_tx_map() splits the linear part of a long
+	 * TSO packet to keep its headers within tx_hdr_buf_max (TSO erratum)
+	 */
 	count++;
 
 	count += DIV_ROUND_UP(len, adapter->tx_fifo_limit);
@@ -7670,7 +7703,8 @@ static int e1000_probe(struct pci_dev *pdev, const struct pci_device_id *ent)
 	/* init PTP hardware clock */
 	e1000e_ptp_init(adapter);
 
-	if (hw->mac.type >= e1000_pch_mtp)
+	/* disable K1 by default on known problematic systems */
+	if (hw->mac.type >= e1000_pch_mtp && dmi_check_system(disable_k1_list))
 		adapter->flags2 |= FLAG2_DISABLE_K1;
 
 	/* reset the hardware with the new settings */
@@ -7706,6 +7740,7 @@ static int e1000_probe(struct pci_dev *pdev, const struct pci_device_id *ent)
 err_register:
 	if (!(adapter->flags & FLAG_HAS_AMT))
 		e1000e_release_hw_control(adapter);
+	e1000e_ptp_remove(adapter);
 err_eeprom:
 	if (hw->phy.ops.check_reset_block && !hw->phy.ops.check_reset_block(hw))
 		e1000_phy_hw_reset(&adapter->hw);

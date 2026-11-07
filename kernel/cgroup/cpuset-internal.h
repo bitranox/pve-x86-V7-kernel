@@ -165,9 +165,15 @@ struct cpuset {
 	 * number of SCHED_DEADLINE tasks attached to this cpuset, so that we
 	 * know when to rebuild associated root domain bandwidth information.
 	 */
-	int nr_deadline_tasks;
+	atomic_t nr_deadline_tasks;
 	int nr_migrate_dl_tasks;
+	/* DL bandwidth that needs destination reservation for this attach. */
 	u64 sum_migrate_dl_bw;
+	/*
+	 * CPU used for temporary DL bandwidth allocation during attach;
+	 * -1 if no DL bandwidth was allocated in the current attach.
+	 */
+	int dl_bw_cpu;
 
 	/* Invalid partition error code, not lock protected */
 	enum prs_errcode prs_err;

@@ -429,9 +429,9 @@ void ivpu_prepare_for_reset(struct ivpu_device *vdev)
 {
 	ivpu_hw_irq_disable(vdev);
 	disable_irq(vdev->irq);
-	flush_work(&vdev->irq_ipc_work);
 	flush_work(&vdev->irq_dct_work);
 	flush_work(&vdev->context_abort_work);
+	flush_work(&vdev->job_destroy_work);
 	ivpu_ipc_disable(vdev);
 	ivpu_mmu_disable(vdev);
 }
@@ -460,6 +460,26 @@ static const struct file_operations ivpu_fops = {
 #endif
 };
 
+static int ivpu_gem_prime_handle_to_fd(struct drm_device *dev, struct drm_file *file_priv,
+				       u32 handle, u32 flags, int *prime_fd)
+{
+	struct drm_gem_object *obj;
+
+	obj = drm_gem_object_lookup(file_priv, handle);
+	if (!obj)
+		return -ENOENT;
+
+	if (drm_gem_is_imported(obj)) {
+		/* Do not allow re-exporting */
+		drm_gem_object_put(obj);
+		return -EOPNOTSUPP;
+	}
+
+	drm_gem_object_put(obj);
+
+	return drm_gem_prime_handle_to_fd(dev, file_priv, handle, flags, prime_fd);
+}
+
 static const struct drm_driver driver = {
 	.driver_features = DRIVER_GEM | DRIVER_COMPUTE_ACCEL,
 
@@ -468,6 +488,7 @@ static const struct drm_driver driver = {
 
 	.gem_create_object = ivpu_gem_create_object,
 	.gem_prime_import = ivpu_gem_prime_import,
+	.prime_handle_to_fd = ivpu_gem_prime_handle_to_fd,
 
 	.ioctls = ivpu_drm_ioctls,
 	.num_ioctls = ARRAY_SIZE(ivpu_drm_ioctls),
@@ -482,6 +503,11 @@ static const struct drm_driver driver = {
 	.major = 1,
 };
 
+static void ivpu_destroy_workqueue(void *wq)
+{
+	destroy_workqueue(wq);
+}
+
 static int ivpu_irq_init(struct ivpu_device *vdev)
 {
 	struct pci_dev *pdev = to_pci_dev(vdev->drm.dev);
@@ -493,16 +519,26 @@ static int ivpu_irq_init(struct ivpu_device *vdev)
 		return ret;
 	}
 
-	INIT_WORK(&vdev->irq_ipc_work, ivpu_ipc_irq_work_fn);
 	INIT_WORK(&vdev->irq_dct_work, ivpu_pm_irq_dct_work_fn);
 	INIT_WORK(&vdev->context_abort_work, ivpu_context_abort_work_fn);
+	init_llist_head(&vdev->job_destroy_list);
+	INIT_WORK(&vdev->job_destroy_work, ivpu_job_destroy_work_fn);
+
+	vdev->job_destroy_wq = alloc_workqueue("ivpu_job_destroy", WQ_UNBOUND | WQ_MEM_RECLAIM, 0);
+	if (!vdev->job_destroy_wq)
+		return -ENOMEM;
+
+	ret = devm_add_action_or_reset(vdev->drm.dev, ivpu_destroy_workqueue, vdev->job_destroy_wq);
+	if (ret)
+		return ret;
 
 	ivpu_irq_handlers_init(vdev);
 
 	vdev->irq = pci_irq_vector(pdev, 0);
 
-	ret = devm_request_irq(vdev->drm.dev, vdev->irq, ivpu_hw_irq_handler,
-			       IRQF_NO_AUTOEN, DRIVER_NAME, vdev);
+	ret = devm_request_threaded_irq(vdev->drm.dev, vdev->irq, ivpu_hw_irq_handler,
+					ivpu_ipc_irq_thread_handler, IRQF_NO_AUTOEN,
+					DRIVER_NAME, vdev);
 	if (ret)
 		ivpu_err(vdev, "Failed to request an IRQ %d\n", ret);
 

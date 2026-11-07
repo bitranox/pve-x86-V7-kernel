@@ -8,7 +8,7 @@
 
 #include <rdma/ib_verbs.h>
 #include <rdma/ib_mad.h>
-#include <rdma/ib_umem.h>
+#include <rdma/iter.h>
 #include <rdma/mana-abi.h>
 #include <rdma/uverbs_ioctl.h>
 #include <linux/dmapool.h>
@@ -101,6 +101,20 @@ struct mana_ib_pd {
 	/* Mutex for sharing access to vport_use_count */
 	struct mutex vport_mutex;
 	int vport_use_count;
+
+	/* Port bound to this PD for raw QP usage. Only valid when
+	 * vport_use_count > 0. A PD can only be associated with a
+	 * single physical port because per-port EQs and vport
+	 * configuration are tied to the PD's refcount.
+	 */
+	u32 vport_port;
+
+	/* Only one RSS QP is allowed per vport because each RSS QP
+	 * overwrites the vport steering config (indirection table /
+	 * hash key) and mana_disable_vport_rx() on destroy would
+	 * blackhole traffic for any other RSS QP on the same vport.
+	 */
+	bool has_rss_qp;
 
 	bool tx_shortform_allowed;
 	u32 tx_vp_offset;

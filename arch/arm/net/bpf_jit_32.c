@@ -1852,6 +1852,9 @@ exit:
 	{
 		u64 val = (u32)imm | (u64)insn[1].imm << 32;
 
+		if (insn->src_reg == BPF_PSEUDO_FUNC)
+			goto notyet;
+
 		emit_a32_mov_i64(dst, val, ctx);
 
 		return 1;
@@ -2055,6 +2058,9 @@ go_jmp:
 		const s8 *r5 = bpf2a32[BPF_REG_5];
 		const u32 func = (u32)__bpf_call_base + (u32)imm;
 
+		if (insn->src_reg == BPF_PSEUDO_CALL)
+			goto notyet;
+
 		emit_a32_mov_r64(true, r0, r1, ctx);
 		emit_a32_mov_r64(true, r1, r2, ctx);
 		emit_push_r64(r5, ctx);
@@ -2165,7 +2171,7 @@ struct bpf_prog *bpf_int_jit_compile(struct bpf_prog *prog)
 	tmp = bpf_jit_blind_constants(prog);
 
 	if (IS_ERR(tmp))
-		return orig_prog;
+		return PTR_ERR(tmp) == -EINTR ? tmp : orig_prog;
 	if (tmp != prog) {
 		tmp_blinded = true;
 		prog = tmp;
@@ -2290,4 +2296,3 @@ out_free:
 	prog = orig_prog;
 	goto out_imms;
 }
-

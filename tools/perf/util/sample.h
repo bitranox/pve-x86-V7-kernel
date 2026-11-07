@@ -5,6 +5,7 @@
 #include <linux/perf_event.h>
 #include <linux/types.h>
 
+struct evsel;
 struct machine;
 struct thread;
 
@@ -82,6 +83,7 @@ struct simd_flags {
 #define SIMD_OP_FLAGS_PRED_EMPTY	0x02	/* empty predicate */
 
 struct perf_sample {
+	struct evsel *evsel;
 	u64 ip;
 	u32 pid, tid;
 	u64 time;
@@ -100,6 +102,8 @@ struct perf_sample {
 	u64 data_page_size;
 	u64 code_page_size;
 	u64 cgroup;
+	/** @file_offset: Byte offset of this event in the perf.data file. */
+	u64 file_offset;
 	u32 flags;
 	u32 machine_pid;
 	u32 vcpu;

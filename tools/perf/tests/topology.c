@@ -43,7 +43,7 @@ static int session_write_header(char *path)
 
 	session->evlist = evlist__new_default();
 	TEST_ASSERT_VAL("can't get evlist", session->evlist);
-	session->evlist->session = session;
+	evlist__set_session(session->evlist, session);
 
 	perf_header__set_feat(&session->header, HEADER_CPU_TOPOLOGY);
 	perf_header__set_feat(&session->header, HEADER_NRCPUS);
@@ -54,7 +54,7 @@ static int session_write_header(char *path)
 	TEST_ASSERT_VAL("failed to write header",
 			!perf_session__write_header(session, session->evlist, data.file.fd, true));
 
-	evlist__delete(session->evlist);
+	evlist__put(session->evlist);
 	perf_session__delete(session);
 
 	return 0;

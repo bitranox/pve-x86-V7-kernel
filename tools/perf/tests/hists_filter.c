@@ -70,6 +70,7 @@ static int add_hist_entries(struct evlist *evlist,
 			};
 			struct hists *hists = evsel__hists(evsel);
 
+			sample.evsel = evsel;
 			/* make sure it has no filter at first */
 			hists->thread_filter = NULL;
 			hists->dso_filter = NULL;
@@ -331,7 +332,7 @@ static int test__hists_filter(struct test_suite *test __maybe_unused, int subtes
 
 out:
 	/* tear down everything */
-	evlist__delete(evlist);
+	evlist__put(evlist);
 	reset_output_field();
 	machines__exit(&machines);
 	put_fake_samples();

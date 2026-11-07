@@ -1060,6 +1060,10 @@ int mt76_connac2_mac_fill_rx_rate(struct mt76_dev *dev,
 		bw = FIELD_GET(MT_CRXV_FRAME_MODE, v2);
 	}
 
+	/* the hardware reports NSTS; report the data NSS for STBC frames */
+	if (stbc && nss > 1)
+		nss >>= 1;
+
 	switch (*mode) {
 	case MT_PHY_TYPE_CCK:
 		cck = true;
@@ -1105,7 +1109,7 @@ int mt76_connac2_mac_fill_rx_rate(struct mt76_dev *dev,
 	case IEEE80211_STA_RX_BW_20:
 		break;
 	case IEEE80211_STA_RX_BW_40:
-		if (*mode & MT_PHY_TYPE_HE_EXT_SU &&
+		if (*mode == MT_PHY_TYPE_HE_EXT_SU &&
 		    (idx & MT_PRXV_TX_ER_SU_106T)) {
 			status->bw = RATE_INFO_BW_HE_RU;
 			status->he_ru =
@@ -1153,8 +1157,10 @@ void mt76_connac2_tx_check_aggr(struct ieee80211_sta *sta, __le32 *txwi)
 		return;
 
 	wcid = (struct mt76_wcid *)sta->drv_priv;
-	if (!test_and_set_bit(tid, &wcid->ampdu_state))
-		ieee80211_start_tx_ba_session(sta, tid, 0);
+	if (!test_and_set_bit(tid, &wcid->ampdu_state)) {
+		if (ieee80211_start_tx_ba_session(sta, tid, 0))
+			clear_bit(tid, &wcid->ampdu_state);
+	}
 }
 EXPORT_SYMBOL_GPL(mt76_connac2_tx_check_aggr);
 

@@ -1256,9 +1256,22 @@ static void skl_sanitize_cdclk(struct intel_display *display)
 	cdctl = intel_de_read(display, CDCLK_CTL);
 	expected = (cdctl & CDCLK_FREQ_SEL_MASK) |
 		skl_cdclk_decimal(display->cdclk.hw.cdclk);
-	if (cdctl == expected)
-		/* All well; nothing to sanitize */
-		return;
+
+	if (cdctl != expected) {
+		cdctl &= ~CDCLK_FREQ_DECIMAL_MASK;
+		cdctl |= expected & CDCLK_FREQ_DECIMAL_MASK;
+
+		if (cdctl != expected)
+			goto sanitize;
+
+		drm_dbg_kms(display->drm, "Sanitizing CDCLK decimal divider (CDCLK_CTL 0x%x, expected 0x%x)\n",
+			    intel_de_read(display, CDCLK_CTL), expected);
+
+		intel_de_write(display, CDCLK_CTL, expected);
+	}
+
+	/* All well; nothing to sanitize */
+	return;
 
 sanitize:
 	drm_dbg_kms(display->drm, "Sanitizing cdclk programmed by pre-os\n");
@@ -2352,12 +2365,28 @@ static void bxt_sanitize_cdclk(struct intel_display *display)
 	 * dividers both syncing to an active pipe, or asynchronously
 	 * (PIPE_NONE).
 	 */
-	cdctl &= ~bxt_cdclk_cd2x_pipe(display, INVALID_PIPE);
-	expected &= ~bxt_cdclk_cd2x_pipe(display, INVALID_PIPE);
+	if (DISPLAY_VER(display) < 30) {
+		cdctl &= ~bxt_cdclk_cd2x_pipe(display, INVALID_PIPE);
+		cdctl |= bxt_cdclk_cd2x_pipe(display, INVALID_PIPE);
+	}
 
-	if (cdctl == expected)
-		/* All well; nothing to sanitize */
-		return;
+	if (cdctl != expected) {
+		if (DISPLAY_VER(display) < 20) {
+			cdctl &= ~CDCLK_FREQ_DECIMAL_MASK;
+			cdctl |= expected & CDCLK_FREQ_DECIMAL_MASK;
+		}
+
+		if (cdctl != expected)
+			goto sanitize;
+
+		drm_dbg_kms(display->drm, "Sanitizing CDCLK decimal divider (CDCLK_CTL 0x%x, expected 0x%x)\n",
+			    intel_de_read(display, CDCLK_CTL), expected);
+
+		intel_de_write(display, CDCLK_CTL, expected);
+	}
+
+	/* All well; nothing to sanitize */
+	return;
 
 sanitize:
 	drm_dbg_kms(display->drm, "Sanitizing cdclk programmed by pre-os\n");
@@ -2669,8 +2698,8 @@ static void intel_set_cdclk(struct intel_display *display,
 	}
 }
 
-static bool dg2_power_well_count(struct intel_display *display,
-				 const struct intel_cdclk_state *cdclk_state)
+static int dg2_power_well_count(struct intel_display *display,
+				const struct intel_cdclk_state *cdclk_state)
 {
 	return display->platform.dg2 ? hweight8(cdclk_state->active_pipes) : 0;
 }
